@@ -13,11 +13,13 @@ use std::cmp::Ordering;
 pub type DocId = u32;
 
 /// One token's documents and its score in each, read in place from the
-/// index: ids ascending, each once, scores alongside.
+/// index: ids ascending, each once, scores alongside. Or a set of documents,
+/// a search filter, each scoring 1 as a Redis set does in `ZINTERSTORE`.
 #[derive(Debug, Clone, Copy)]
 pub struct PostingList<'a> {
     ids: &'a [DocId],
     scores: &'a [f64],
+    set: bool,
 }
 
 impl<'a> PostingList<'a> {
@@ -25,7 +27,25 @@ impl<'a> PostingList<'a> {
     /// writes them so; `intersect` relies on it.
     pub fn new(ids: &'a [DocId], scores: &'a [f64]) -> Self {
         assert_eq!(ids.len(), scores.len(), "a score per document");
-        PostingList { ids, scores }
+        PostingList {
+            ids,
+            scores,
+            set: false,
+        }
+    }
+
+    /// A set of documents, ids ascending, each once, each scoring 1.
+    pub fn set(ids: &'a [DocId]) -> Self {
+        PostingList {
+            ids,
+            scores: &[],
+            set: true,
+        }
+    }
+
+    /// The score of its `i`th document.
+    fn score(&self, i: usize) -> f64 {
+        if self.set { 1.0 } else { self.scores[i] }
     }
 
     /// How many documents it holds: addok's token frequency (`ZCARD`).
@@ -44,7 +64,10 @@ impl<'a> PostingList<'a> {
 
     /// Its best score, 0 when empty: addok's `order_by_max_score` script.
     pub fn max_score(&self) -> f64 {
-        self.scores.iter().copied().fold(0.0, f64::max)
+        match self.set {
+            true if !self.ids.is_empty() => 1.0,
+            _ => self.scores.iter().copied().fold(0.0, f64::max),
+        }
     }
 }
 
@@ -73,7 +96,7 @@ fn select(lists: &[PostingList], limit: usize, ties: bool) -> (Vec<(DocId, f64)>
     let ids: Vec<&[DocId]> = lists.iter().map(|list| list.ids).collect();
     let mut found = Vec::new();
     for_each_common(&ids, |id, positions| {
-        let mut scores = lists.iter().zip(positions).map(|(list, &i)| list.scores[i]);
+        let mut scores = lists.iter().zip(positions).map(|(list, &i)| list.score(i));
         let first = scores.next().unwrap();
         found.push((id, scores.fold(first, |sum, score| sum + score)));
     });
@@ -99,6 +122,27 @@ pub fn intersect_sets(sets: &[&[u32]]) -> Vec<u32> {
     let mut found = Vec::new();
     for_each_common(&sets, |id, _| found.push(id));
     found
+}
+
+/// The members of any of the sets, ascending, each once. Each set is sorted
+/// ascending, without duplicates: merged two by two, in linear time, rather
+/// than sorted again.
+pub fn union_sets(sets: &[&[u32]]) -> Vec<u32> {
+    let mut union: Vec<u32> = Vec::new();
+    for set in sets {
+        let mut merged = Vec::with_capacity(union.len() + set.len());
+        let (mut i, mut j) = (0, 0);
+        while i < union.len() && j < set.len() {
+            let (x, y) = (union[i], set[j]);
+            merged.push(x.min(y));
+            i += usize::from(x <= y);
+            j += usize::from(y <= x);
+        }
+        merged.extend_from_slice(&union[i..]);
+        merged.extend_from_slice(&set[j..]);
+        union = merged;
+    }
+    union
 }
 
 /// Best first: score descending, then id ascending.
@@ -239,6 +283,21 @@ mod tests {
         // A cut between two scores ties nothing.
         assert!(intersect_with_ties(&[a.view()], 4).1.is_empty());
         assert!(intersect_with_ties(&[a.view()], 10).1.is_empty());
+    }
+
+    #[test]
+    fn scores_each_document_of_a_set_1() {
+        let a = list(&[(1, 0.5), (2, 0.25), (3, 0.125)]);
+        let filter = [2, 3, 4];
+        let found = intersect(&[a.view(), PostingList::set(&filter)], 10);
+        assert_eq!(found, [(2, 1.25), (3, 1.125)]);
+    }
+
+    #[test]
+    fn unites_sets() {
+        let sets: [&[u32]; 3] = [&[1, 4, 9], &[2, 4, 10], &[]];
+        assert_eq!(union_sets(&sets), [1, 2, 4, 9, 10]);
+        assert!(union_sets(&[]).is_empty());
     }
 
     #[test]

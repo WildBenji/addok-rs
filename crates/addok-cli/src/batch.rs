@@ -5,6 +5,7 @@
 //! minimum score are `/search/csv`'s, `result_street` aside, which no BAN
 //! document fills.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,7 +22,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-use crate::geocoded::{Geocoded, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
+use crate::geocoded::{FilterColumns, Geocoded, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
 use crate::pycsv::{self, Dialect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +83,8 @@ pub struct Options {
     /// The result columns asked for besides the default ones: those of
     /// `SPLIT_COLUMNS` named here are added, other names ignored.
     pub result_columns: Vec<String>,
+    /// The columns whose values filter each row's search.
+    pub filters: FilterColumns,
 }
 
 /// Why a table cannot be geocoded.
@@ -149,6 +152,14 @@ pub fn read(bytes: Vec<u8>, format: Format) -> Result<RecordBatch, Error> {
     }
 }
 
+/// A row's text in a column, empty if null.
+fn cell(column: &StringArray, row: usize) -> &str {
+    match column.is_null(row) {
+        true => "",
+        false => column.value(row),
+    }
+}
+
 /// The table, each row with its best result, and what geocoding left undone:
 /// a row whose query is too long gets no result, and is reported.
 pub fn geocode_table<B: AsRef<[u8]> + Sync>(
@@ -161,21 +172,23 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
         true => schema.fields().iter().map(|field| field.name().as_str()).collect(),
         false => options.columns.iter().map(String::as_str).collect(),
     };
-    let mut columns = Vec::new();
-    for name in names {
+    let text = |name: &str| -> Result<StringArray, Error> {
         let column = table
             .column_by_name(name)
             .ok_or_else(|| Error(format!("no column \"{name}\"")))?;
         let text = cast(column, &DataType::Utf8).map_err(error)?;
-        columns.push(text.as_any().downcast_ref::<StringArray>().unwrap().clone());
+        Ok(text.as_any().downcast_ref::<StringArray>().unwrap().clone())
+    };
+    let columns = names.into_iter().map(text).collect::<Result<Vec<_>, _>>()?;
+    let mut filter_columns = HashMap::new();
+    for name in options.filters.columns() {
+        filter_columns.insert(name.as_str(), text(name)?);
     }
     let query = |row: usize| {
-        let values = columns.iter().map(|column| match column.is_null(row) {
-            true => "",
-            false => column.value(row),
-        });
+        let values = columns.iter().map(|column| cell(column, row));
         values.collect::<Vec<_>>().join(" ")
     };
+    let filters = |row: usize| options.filters.filters(|name| cell(&filter_columns[name], row));
 
     let blocks: Vec<std::ops::Range<usize>> = (0..table.num_rows())
         .step_by(1_000)
@@ -190,7 +203,7 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
                     let (mut done, mut long) = (Vec::new(), Vec::new());
                     while let Some(rows) = blocks.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let block = rows.clone().map(|row| {
-                            geocode(index, &query(row), options.min_score, options.postcode_fallback)
+                            geocode(index, &query(row), &filters(row), options.min_score, options.postcode_fallback)
                                 .unwrap_or_else(|_| {
                                     long.push(row + 1);
                                     None
@@ -357,6 +370,7 @@ mod tests {
             threads: 2,
             postcode_fallback: false,
             result_columns: Vec::new(),
+            filters: FilterColumns::default(),
         }
     }
 
@@ -441,6 +455,31 @@ mod tests {
         let table = read(b"a;b\n1;2\n".to_vec(), Format::Csv { delimiter: ';' }).unwrap();
         let refused = geocode_table(&index(), &table, &options(&["c"]));
         assert_eq!(refused, Err(Error("no column \"c\"".into())));
+        let mut filtered = options(&["a"]);
+        filtered.filters.postcode = vec!["zip".to_owned()];
+        let refused = geocode_table(&index(), &table, &filtered);
+        assert_eq!(refused, Err(Error("no column \"zip\"".into())));
+    }
+
+    #[test]
+    fn filters_each_row_by_its_own_value() {
+        let csv = "id;street;zip;kind\n1;MONTEE DE LA FORET;01640;\n2;MONTEE DE LA FORET;69001;\n3;MONTEE DE LA FORET;;municipality\n";
+        let table = read(csv.as_bytes().to_vec(), Format::Csv { delimiter: ';' }).unwrap();
+        let mut filtered = options(&["street"]);
+        filtered.filters = FilterColumns {
+            kind: vec!["kind".to_owned()],
+            citycode: Vec::new(),
+            postcode: vec!["zip".to_owned()],
+        };
+        let (geocoded, _) = geocode_table(&index(), &table, &filtered).unwrap();
+        let types = geocoded.column_by_name("result_type").unwrap();
+        let types = types.as_any().downcast_ref::<StringArray>().unwrap();
+        // Its postcode: found. Another one: nothing. An empty cell filters
+        // nothing, and the third row's type keeps only municipalities,
+        // which the street's name does not find.
+        assert_eq!(types.value(0), "street");
+        assert!(types.is_null(1));
+        assert!(types.is_null(2));
     }
 
     #[test]

@@ -34,7 +34,7 @@ use axum::routing::{get, post};
 use tokio::sync::Semaphore;
 
 use crate::batch::{self, Format, Options};
-use crate::geocoded::{MIN_SCORE, Warning};
+use crate::geocoded::{FilterColumns, MIN_SCORE, Warning};
 use crate::search_csv::{self, Error, Request, flag};
 
 struct Server<B> {
@@ -207,12 +207,14 @@ fn batch_options(request: &Request) -> Result<(Format, Format, Options), String>
     };
     let columns = request.params.get("columns").cloned().unwrap_or_default();
     let result_columns = request.params.get("result_columns").cloned().unwrap_or_default();
+    let filters = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
     let options = Options {
         columns,
         min_score,
         threads: 1,
         postcode_fallback,
         result_columns,
+        filters,
     };
     Ok((input, output, options))
 }

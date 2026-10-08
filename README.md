@@ -102,6 +102,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 - **Une seule ligne de plus de 200 caractères fait refuser tout le fichier,** avec l'erreur 413.
 - **La colonne `result_street` est toujours vide.**
 - **Il ne connaît que le CSV :** tout est converti en texte, à l'aller comme au retour.
+- **Ses filtres ne fonctionnent plus** avec addok 1.3.2 : addok-csv 1.1.0 échoue dès qu'on lui en passe un.
 
 ---
 
@@ -124,6 +125,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 - **`POST /search/csv` reproduit addok-csv à l'octet près,** moins ses trois défauts. Un client d'addok existant passe à addok-rs en changeant seulement l'URL.
 - **`POST /batch` prend du Parquet ou du CSV et rend du Parquet ou du CSV.** Les colonnes d'origine gardent leur type, et les résultats sont typés : scores et coordonnées en nombres, `null` en l'absence de résultat.
 - **`addok-cli batch` géocode un fichier entier sans serveur,** sur tous les cœurs.
+- **Les filtres d'addok** (`type`, `citycode`, `postcode`) sur les trois interfaces : chaque ligne est filtrée par la valeur de ses propres colonnes, ce qu'addok-csv 1.1.0 ne sait plus faire. Ils donnent les réponses d'addok 1.3.2 sous les mêmes filtres : 99,87 % de réponses identiques sur 540 226 recherches filtrées, chaque écart expliqué.
 - **Une ligne invalide n'est plus fatale.** Une adresse trop longue reste seule sans résultat, et un en-tête `X-Addok-Warning` dit laquelle.
 
 ### Des réponses reproductibles
@@ -204,7 +206,6 @@ addok-rs est un géocodeur **par lots, pour les adresses françaises de la BAN**
 
 - **Ce n'est pas un géocodeur généraliste.** addok assemble son pipeline à partir de plugins déclarés dans sa configuration ; addok-rs écrit en dur la seule combinaison que la BAN utilise : phonétique et synonymes français, types de voie, compléments `bis` et `ter`, clavier AZERTY pour les fautes de frappe, schéma des documents de la BAN. Une seule combinaison, c'est ce qui permet de vérifier chaque réponse face à addok et de garder le code direct. Indexer une autre source ou un autre pays demanderait de changer le code, pas la configuration.
 - **Ces fonctions d'addok ne sont pas encore portées** :
-  - les **filtres** (`type`, `citycode`, `postcode`), qu'addok-rs refuse avec une erreur 400 plutôt que de les ignorer en silence ;
   - la **recherche autour d'un point** (`lat`, `lon`) et le **géocodage inverse** ;
   - le point d'entrée JSON `/search`, et l'autocomplétion.
 - **Pas d'authentification,** comme addok : le serveur est fait pour un réseau interne.

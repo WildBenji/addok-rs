@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use addok_cli::batch::{self, Format, Options};
-use addok_cli::geocoded::MIN_SCORE;
+use addok_cli::geocoded::{FilterColumns, MIN_SCORE};
 use addok_cli::search_csv::flag;
 use addok_core::document::Document;
 use addok_core::index::{Index, OpenError, write};
@@ -37,6 +37,8 @@ usage:
     --postcode-fallback on    search again without a wrong postcode (default: off)
     --result-columns A,B      add the house number split: result_num, result_num_complement,
                               result_num_complement_short (default: none)
+    --filters F=COL,F=COL     keep the results each row's value in COL allows, for each
+                              filter F: type, citycode or postcode (default: none)
     --cores N                 (see below)
   addok-cli --version                      print addok-cli's version, as /health gives it
 
@@ -138,6 +140,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
     let (mut input_delimiter, mut output_delimiter) = (batch::DELIMITER, batch::DELIMITER);
     let mut min_score = MIN_SCORE;
     let mut postcode_fallback = false;
+    let mut filters = FilterColumns::default();
     let mut cores = available_cores();
     let one = |value: &str| {
         let mut chars = value.chars();
@@ -156,6 +159,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
             ["--output-delimiter", value] => output_delimiter = one(value)?,
             ["--min-score", value] => min_score = value.parse().map_err(|_| USAGE.to_owned())?,
             ["--postcode-fallback", value] => postcode_fallback = flag(value).ok_or(USAGE.to_owned())?,
+            ["--filters", value] => filters = filter_columns(value)?,
             ["--cores", value] => cores = parse_cores(value)?,
             _ => return Err(USAGE.to_owned()),
         }
@@ -177,6 +181,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
         threads: cores,
         postcode_fallback,
         result_columns,
+        filters,
     };
     let (geocoded, warnings) = batch::geocode_table(&index, &table, &options).map_err(|e| format!("{input}: {e}"))?;
     for warning in &warnings {
@@ -191,6 +196,22 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
         table.num_rows() as f64 / elapsed
     );
     Ok(())
+}
+
+/// `--filters type=COL,postcode=COL`: the columns of each filter, a filter
+/// named once per column.
+fn filter_columns(value: &str) -> Result<FilterColumns, String> {
+    let mut filters = FilterColumns::default();
+    for pair in value.split(',') {
+        let column = |prefix: &str| pair.strip_prefix(prefix).filter(|column| !column.is_empty()).map(str::to_owned);
+        match (column("type="), column("citycode="), column("postcode=")) {
+            (Some(column), _, _) => filters.kind.push(column),
+            (_, Some(column), _) => filters.citycode.push(column),
+            (_, _, Some(column)) => filters.postcode.push(column),
+            _ => return Err(format!("--filters takes type=, citycode= or postcode= and a column, not {pair:?}")),
+        }
+    }
+    Ok(filters)
 }
 
 /// The cores this process may use: the machine's, or fewer where a

@@ -9,6 +9,7 @@ mod encoding;
 mod format;
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::io::{self, Write};
 
 use bytemuck::Pod;
@@ -113,7 +114,14 @@ pub fn write(
 pub struct Index<B> {
     bytes: B,
     sections: Sections,
+    /// The unions of a filter's values, kept once made, by filter and
+    /// values: addok keeps those of over 100,000 documents in Redis, and
+    /// `type=street locality` unites over a million.
+    unions: Mutex<HashMap<String, Arc<[DocId]>>>,
 }
+
+/// How many unions an index keeps; past that, it starts over.
+const UNIONS_KEPT: usize = 64;
 
 impl<B: AsRef<[u8]>> Index<B> {
     /// Checks that the bytes hold an index this build reads: its trailer, its
@@ -121,7 +129,11 @@ impl<B: AsRef<[u8]>> Index<B> {
     /// corrupt index makes a read panic, never read out of bounds.
     pub fn open(bytes: B) -> Result<Index<B>, OpenError> {
         let sections = Sections::read(bytes.as_ref())?;
-        Ok(Index { bytes, sections })
+        Ok(Index {
+            bytes,
+            sections,
+            unions: Mutex::default(),
+        })
     }
 
     fn array<T: Pod>(&self, kind: Kind) -> &[T] {
@@ -355,6 +367,27 @@ impl<B: AsRef<[u8]>> Index<B> {
             Some(i) => self.list(Kind::FilterOffsets, Kind::Filters, i),
             None => &[],
         }
+    }
+}
+
+impl<B: AsRef<[u8]>> Index<B> {
+    /// The documents any of a filter's values holds, ascending: addok's
+    /// `SUNIONSTORE` of `f|<name>|<value>`, made once per set of values.
+    pub fn filter_union(&self, name: &str, values: &[&str]) -> Arc<[DocId]> {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let key = format!("{name}|{}", sorted.join("|"));
+        let mut unions = self.unions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(union) = unions.get(&key) {
+            return union.clone();
+        }
+        let lists: Vec<&[DocId]> = sorted.iter().map(|value| self.filter(name, value)).collect();
+        let union: Arc<[DocId]> = crate::postings::union_sets(&lists).into();
+        if unions.len() >= UNIONS_KEPT {
+            unions.clear();
+        }
+        unions.insert(key, union.clone());
+        union
     }
 }
 

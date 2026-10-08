@@ -166,6 +166,7 @@ Le fichier de sortie reprend **toutes les lignes et toutes les colonnes** du fic
 | `--min-score X` | Score arrondi qu'un résultat doit dépasser pour être retenu | `0.5` |
 | `--postcode-fallback on` | Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) quand le code postal est faux | désactivé |
 | `--result-columns A,B` | Ajoute le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) : `result_num`, `result_num_complement`, `result_num_complement_short` | aucune |
+| `--filters F=COL,F=COL` | [Filtre](#filtrer-les-résultats) chaque ligne par la valeur de la colonne `COL`, pour chaque filtre `F` : `type`, `citycode` ou `postcode` | aucun |
 | `--cores N` | Nombre de cœurs à utiliser, de 1 au nombre disponible | tous |
 
 Les extensions reconnues sont `.parquet` et `.pq` pour Parquet, `.csv` et `.txt` pour CSV. Pour tout autre nom, il faut préciser `--input-format` ou `--output-format`.
@@ -283,6 +284,7 @@ Les deux points d'entrée de géocodage reçoivent un formulaire `multipart/form
 | `min_score` | Score arrondi qu'un résultat doit dépasser | `0.5` |
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (`true`, `on` et `yes` valent aussi) | désactivé |
 | `result_columns` | Une colonne de résultat en plus ; répéter le champ pour chacune : `result_num`, `result_num_complement`, `result_num_complement_short` ([numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte)). Les autres noms sont ignorés | aucune |
+| `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne | aucun filtre |
 
 **La réponse** est le fichier géocodé, en `application/vnd.apache.parquet` ou en `text/csv; charset=utf-8`, proposé sous le nom `<nom-envoyé>.geocoded.parquet` (ou `.csv`).
 
@@ -304,6 +306,7 @@ Les deux points d'entrée de géocodage reçoivent un formulaire `multipart/form
 | `with_bom` | `true` pour ajouter une marque d'ordre d'octets en tête de réponse | `false` |
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (propre à addok-rs) | désactivé |
 | `result_columns` | Comme dans `/batch` : seuls `result_num`, `result_num_complement` et `result_num_complement_short` ajoutent une colonne, après les 16 d'addok-csv (propre à addok-rs). Les autres noms ne changent rien, comme dans addok-csv | aucune |
+| `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne, comme dans addok-csv | aucun filtre |
 
 **La réponse :**
 
@@ -319,12 +322,16 @@ Les deux points d'entrée de géocodage reçoivent un formulaire `multipart/form
 - **La colonne `result_street`,** qu'addok-csv écrit toujours vide (aucun document de la BAN ne porte de rue), n'est plus écrite.
 - **Une ligne trop longue ne fait plus échouer toute la requête.** addok refuse une requête de plus de 200 caractères, et addok-csv refuse alors le fichier entier (erreur 413) : une seule ligne de texte parasite coûtait leur résultat à toutes les autres. Désormais, cette ligne reste sans résultat, les autres sont géocodées, et l'en-tête [`X-Addok-Warning`](#len-tête-x-addok-warning) la signale.
 
+#### Les filtres, qu'addok-csv 1.1.0 n'applique plus
+
+Avec addok 1.3.2, addok-csv 1.1.0 échoue dès qu'on lui passe un filtre. addok-rs applique les filtres comme addok-csv l'entend : chaque champ nomme une colonne, dont la valeur filtre sa ligne (voir [Filtrer les résultats](#filtrer-les-résultats)).
+
 #### Paramètres refusés
 
-Les filtres d'addok (`type`, `citycode`, `postcode`) et le géocodage autour d'un point (`lat`, `lon`) ne sont pas encore portés. Plutôt que de les ignorer en silence, addok-rs refuse la requête avec une erreur 400 :
+Le géocodage autour d'un point (`lat`, `lon`) n'est pas encore porté. Plutôt que de l'ignorer en silence, addok-rs refuse la requête avec une erreur 400 :
 
 ```json
-{"title": "Unsupported parameter \"postcode\""}
+{"title": "Unsupported parameter \"lat\""}
 ```
 
 ### `GET /health`
@@ -334,7 +341,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.7.0"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.8.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -493,6 +500,34 @@ En CSV, toutes ces valeurs sont du texte et une valeur absente est une cellule v
 
 Il n'y a rien de particulier à faire. Si le code postal ou la ville manque dans une ligne, laissez la cellule vide : la recherche s'appuie sur le reste de l'adresse. Le résultat apporte alors le code postal (`result_postcode`), la commune (`result_city`), le code INSEE (`result_citycode`) et le contexte (`result_context`) de l'adresse trouvée. Ce cas est vérifié face à addok, avec 99,90 % de réponses identiques sans code postal et 99,92 % sans ville.
 
+### Filtrer les résultats
+
+Les filtres d'addok ne gardent que les adresses d'un type, d'une commune ou d'un code postal :
+
+| Filtre | Garde les résultats… |
+|---|---|
+| `type` | de ce type : `housenumber`, `street`, `locality` ou `municipality` |
+| `citycode` | de cette commune (code INSEE) |
+| `postcode` | de ce code postal |
+
+Sur un fichier, un filtre ne prend pas une valeur mais **le nom d'une colonne** : chaque ligne est filtrée par sa propre valeur, comme dans addok-csv.
+
+```sh
+# Chaque adresse cherchée dans le code postal de sa colonne code_postal
+curl -F data=@adresses.csv -F columns=adresse -F columns=ville \
+     -F postcode=code_postal http://localhost:7878/search/csv -o geocodees.csv
+
+# La même chose sans serveur, en ne gardant que les numéros
+addok-cli batch ban.addok adresses.parquet geocodees.parquet \
+     --columns adresse,ville --filters postcode=code_postal,type=type_voulu
+```
+
+- **Plusieurs filtres :** une adresse doit les satisfaire tous. **Plusieurs colonnes pour un même filtre** (`-F postcode=cp1 -F postcode=cp2`) : l'une ou l'autre de leurs valeurs suffit.
+- **Une cellule vide ne filtre rien** pour sa ligne.
+- **Une colonne absente du fichier est refusée,** comme une colonne de requête absente.
+- **`type` décide du numéro.** Avec `housenumber` pour seule valeur, une ligne n'a de résultat que si son numéro est trouvé. Avec `street`, `locality` ou `municipality` seuls, le numéro de la requête est ignoré. Sans `type`, ou avec `housenumber` parmi d'autres valeurs, le numéro est cherché comme d'habitude.
+- **Un filtre est une contrainte stricte.** Il réduit ce que la recherche peut trouver : sous filtre, addok ne tente pas non plus de corriger les fautes de frappe d'une adresse dont d'autres mots sont trouvés. addok-rs fait de même. Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) garde lui aussi les filtres : avec un filtre `postcode`, il ne peut pas sortir de ce code postal.
+
 ### Code postal faux : le repli sur la commune
 
 Sur demande, un code postal faux ne fait plus perdre l'adresse. C'est le cas en particulier dans les villes à plusieurs codes postaux, quand le code saisi est celui de la ville mais d'un autre quartier. C'est la seule différence de géocodage voulue avec addok. Par exemple :
@@ -576,7 +611,7 @@ addok-rs est fait pour remplacer un addok qui géocode par lots avec `/search/cs
 2. **Lancez le serveur** sur le port 7878, comme addok ([section 5](#5-faire-tourner-le-serveur--addok-cli-serve)).
 3. **Pointez le client vers addok-rs.** `/search/csv` accepte les mêmes paramètres et rend les mêmes colonnes, dans le même ordre et au même format. Seule `result_street`, toujours vide chez addok-csv, disparaît.
 4. **Recalibrez votre seuil de confiance.** addok-rs suit addok 1.3.2. Si vous veniez de l'image `etalab/addok` (addok 1.0.3, de 2022), les scores bougent  : trois ans de corrections amont séparent les deux (66 types de voie reconnus au lieu d'environ 38, libellés des communes fusionnées, règles phonétiques réécrites). Mesurez le seuil sur un échantillon vérifié de vos propres données.
-5. **Retirez les paramètres non portés.** Les filtres (`type`, `citycode`, `postcode`) et `lat`/`lon` sont refusés avec une erreur 400, plutôt qu'ignorés en silence.
+5. **Retirez les paramètres non portés.** `lat` et `lon` sont refusés avec une erreur 400, plutôt qu'ignorés en silence. Les filtres (`type`, `citycode`, `postcode`), eux, fonctionnent, alors qu'addok-csv 1.1.0 échouait dessus.
 6. **Retirez les contournements devenus inutiles :** le champ `delimiter` envoyé pour éviter un séparateur mal deviné, et le nettoyage des lignes trop longues fait pour ne pas perdre tout un fichier.
 7. **Une fois la bascule faite,** Redis et SQLite peuvent être arrêtés.
 
@@ -600,7 +635,8 @@ Ensuite, deux pas facultatifs :
 | `no column "adresse"` | Une colonne de `--columns` (ou du champ `columns`) n'existe pas dans le fichier | Vérifier les noms et la casse ; pour un CSV, vérifier aussi le séparateur |
 | `the CSV is not UTF-8` | CSV d'entrée dans un autre encodage (Windows-1252, par exemple) | Le convertir en UTF-8 |
 | 400 `Cannot found column 'adresse' in columns ['adresse,ville,code_postal']` | `/search/csv` : une colonne demandée n'existe pas dans le fichier, quel que soit le séparateur usuel essayé | Vérifier les noms de colonnes ; pour un séparateur inhabituel, l'indiquer avec le champ `delimiter` |
-| 400 `Unsupported parameter "postcode"` | Filtre ou position non portés | Retirer le paramètre ([Limites actuelles](#13-limites-actuelles)) |
+| 400 `Cannot found column 'cp' in columns [...]`, ou `no column "cp"` | Un filtre nomme une colonne que le fichier n'a pas | Vérifier le nom de la colonne donnée au filtre |
+| 400 `Unsupported parameter "lat"` | Position non portée | Retirer le paramètre ([Limites actuelles](#13-limites-actuelles)) |
 | En-tête `X-Addok-Warning: query_too_long; …; rows=12`, ou `warning: 1 row longer than 200 characters left without a result: row 12` | Une ligne dépasse 200 caractères : elle reste sans résultat, les autres sont géocodées | Nettoyer la ligne indiquée, souvent du texte parasite (lorem ipsum, données de test) |
 | `/data/ban.addok: No such file or directory`, le conteneur s'arrête aussitôt | Pas d'index à la racine du dossier monté sur `/data`, ou sous un autre nom | Vérifier le chemin du volume et le nom du fichier ([Avec Docker](#avec-docker)) |
 | `Permission denied` en construisant l'index avec Docker | Le dossier monté n'est pas accessible en écriture à l'utilisateur du conteneur | Ajouter `--user "$(id -u):$(id -g)"` |
@@ -612,7 +648,6 @@ Ensuite, deux pas facultatifs :
 
 Ces fonctions d'addok ne sont pas encore portées :
 
-- **les filtres** (`type`, `citycode`, `postcode`) ;
 - **la recherche autour d'un point** (`lat`, `lon`) et **le géocodage inverse** (`/reverse`, `/reverse/csv`) ;
 - **le point d'entrée JSON** `/search`, et l'autocomplétion.
 

@@ -1,13 +1,16 @@
 //! Search: what addok answers to a query, ported from addok 1.3.2's `Search`
 //! (addok/core.py) with the preprocessors, collectors and result processors
 //! the BAN configures, and addok-france's labels. Only addok-csv's call is
-//! ported: autocomplete off, fuzzy on, no filter, no position. Ported to
+//! ported: autocomplete off, fuzzy on, filters but no position. Ported to
 //! answer as addok does, quirks included, but for ties: where addok's order
 //! follows Python's hash seed or Redis's, results rank by score, then by
 //! document number.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::document::{Document, HouseNumber, Number, TextRef};
 use crate::index::{Index, TokenId};
@@ -27,6 +30,8 @@ const MAX_MEANINGFUL: usize = 10;
 /// How many of a common token's documents the `manual_scan` script looks
 /// at: its `ZREVRANGE 0 500`.
 const MANUAL_SCAN: usize = 501;
+/// addok's `MAX_FILTER_VALUES`: the values of one filter it considers.
+const MAX_FILTER_VALUES: usize = 10;
 
 /// addok's `FUZZY_KEY_MAP`: the keys around each letter of an AZERTY keyboard.
 const FUZZY_KEY_MAP: [(char, &str); 26] = [
@@ -98,6 +103,90 @@ impl Found {
     }
 }
 
+/// The filters a search keeps only the documents of, by the BAN's `FILTERS`:
+/// for each, the values a document may hold, any of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Filters {
+    /// `type`: `housenumber`, `street`, `locality` or `municipality`.
+    pub kind: Vec<String>,
+    /// The commune's INSEE code.
+    pub citycode: Vec<String>,
+    pub postcode: Vec<String>,
+}
+
+impl Filters {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_empty() && self.citycode.is_empty() && self.postcode.is_empty()
+    }
+
+    /// addok's `_build_filters`, which makes them one key: each filter's
+    /// values trimmed, empty ones dropped, the first 10 distinct kept, their
+    /// documents united; then the filters' documents intersected. `None`
+    /// without filters. Never copied when it can be helped: a lone value's
+    /// documents are the index's own list, several values' union the index
+    /// keeps once made. `type=street` alone holds over a million.
+    fn documents<'a, B: AsRef<[u8]>>(&self, index: &'a Index<B>) -> Option<FilterDocs<'a>> {
+        let mut sets: Vec<FilterDocs<'a>> = Vec::new();
+        for (name, values) in [("type", &self.kind), ("citycode", &self.citycode), ("postcode", &self.postcode)] {
+            let mut distinct: Vec<&str> = Vec::new();
+            for value in values.iter().map(|value| value.trim()) {
+                if !value.is_empty() && !distinct.contains(&value) {
+                    distinct.push(value);
+                }
+            }
+            distinct.truncate(MAX_FILTER_VALUES);
+            if distinct.is_empty() {
+                continue;
+            }
+            sets.push(match distinct[..] {
+                [value] => FilterDocs::Index(index.filter(name, value)),
+                _ => FilterDocs::Shared(index.filter_union(name, &distinct)),
+            });
+        }
+        match sets.len() {
+            0 => None,
+            1 => sets.pop(),
+            _ => {
+                let sets: Vec<&[DocId]> = sets.iter().map(|set| &**set).collect();
+                Some(FilterDocs::Shared(postings::intersect_sets(&sets).into()))
+            }
+        }
+    }
+
+    /// addok's `_setup_housenumber_checks`, on the `type` values as given:
+    /// whether to match the query's house number, and whether a result must
+    /// have one.
+    fn housenumber_checks(&self) -> (bool, bool) {
+        if self.kind.is_empty() {
+            return (true, false);
+        }
+        let only = self.kind.iter().all(|kind| kind == "housenumber");
+        (self.kind.iter().any(|kind| kind == "housenumber"), only)
+    }
+}
+
+/// The documents the filters hold: the index's own list, or a set made of
+/// several, shared.
+enum FilterDocs<'a> {
+    Index(&'a [DocId]),
+    Shared(Arc<[DocId]>),
+}
+
+impl Deref for FilterDocs<'_> {
+    type Target = [DocId];
+
+    fn deref(&self) -> &[DocId] {
+        match self {
+            FilterDocs::Index(docs) => docs,
+            FilterDocs::Shared(docs) => docs,
+        }
+    }
+}
+
+/// The filters' key among a search's keys, as addok's `f|…` keys sit among
+/// its `w|…` ones: no token can be it, holding a `|`.
+const FILTER_KEY: &str = "f|";
+
 /// A document's scores, as a `Found` holds them.
 #[derive(Debug, Clone, Copy)]
 struct Scored {
@@ -113,7 +202,18 @@ pub fn search<B: AsRef<[u8]>>(
     query: &str,
     limit: usize,
 ) -> Result<Vec<Found>, QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit)?;
+    search_filtered(index, query, limit, &Filters::default())
+}
+
+/// `search`, keeping only the documents the filters hold: addok's
+/// `search(q, autocomplete=False, limit=limit, **filters)`.
+pub fn search_filtered<B: AsRef<[u8]>>(
+    index: &Index<B>,
+    query: &str,
+    limit: usize,
+    filters: &Filters,
+) -> Result<Vec<Found>, QueryTooLong> {
+    let mut helper = Helper::new(index, query, limit, filters)?;
     helper.collect();
     Ok(helper.render())
 }
@@ -145,20 +245,22 @@ pub struct Order {
     pub tokens: Vec<String>,
 }
 
-/// `search` in the order given, and its trace.
+/// `search_filtered` in the order given, and its trace.
 pub fn search_traced<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
     limit: usize,
+    filters: &Filters,
     order: &Order,
 ) -> Result<(Vec<Found>, Trace), QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit)?;
+    let mut helper = Helper::new(index, query, limit, filters)?;
     helper.order = order.clone();
     helper.trace = Some(Tracing::default());
     helper.debug(|h| format!("Taken tokens: {}", tokens(&h.meaningful)));
     helper.debug(|h| format!("Common tokens: {}", tokens(&h.common)));
     helper.debug(|h| format!("Housenumbers token: {}", h.housenumber));
     helper.debug(|h| format!("Not found tokens: {}", tokens(&h.not_found)));
+    helper.debug(|_| format!("Filters: {filters:?}"));
     helper.collect();
     let tracing = helper.trace.take().unwrap_or_default();
     let mut tied: Vec<DocId> = tracing.tied.into_iter().collect();
@@ -193,7 +295,11 @@ fn tokens(tokens: &[Token]) -> String {
 
 /// Keys as addok logs them.
 fn keys(keys: &[String]) -> String {
-    let keys: Vec<String> = keys.iter().map(|key| format!("'w|{key}'")).collect();
+    let key = |key: &String| match key == FILTER_KEY {
+        true => format!("'{key}'"),
+        false => format!("'w|{key}'"),
+    };
+    let keys: Vec<String> = keys.iter().map(key).collect();
     format!("[{}]", keys.join(", "))
 }
 
@@ -254,6 +360,12 @@ struct Helper<'i, B> {
     bucket: HashSet<DocId>,
     /// The bucket's documents scored so far.
     results: HashMap<DocId, Scored>,
+    /// The documents the filters hold, `FILTER_KEY` among the keys.
+    filter: Option<Rc<FilterDocs<'i>>>,
+    /// Whether to match the query's house number, and whether a result must
+    /// have one: the `type` filter's say.
+    check_housenumber: bool,
+    only_housenumber: bool,
     order: Order,
     trace: Option<Tracing>,
 }
@@ -261,7 +373,12 @@ struct Helper<'i, B> {
 impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     /// The query folded and tokenized, its tokens looked up and sorted
     /// out: addok's `SEARCH_PREPROCESSORS`.
-    fn new(index: &'i Index<B>, query: &str, wanted: usize) -> Result<Self, QueryTooLong> {
+    fn new(
+        index: &'i Index<B>,
+        query: &str,
+        wanted: usize,
+        filters: &Filters,
+    ) -> Result<Self, QueryTooLong> {
         let query = text::fold(query);
         let processed = text::query_tokens(&query)?;
         let last = processed.len().checked_sub(1);
@@ -304,6 +421,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             common.extend(meaningful.split_off(MAX_MEANINGFUL));
         }
         let should_match_threshold = (2.0 / 3.0 * tokens.len() as f64).ceil() as usize;
+        let (check_housenumber, only_housenumber) = filters.housenumber_checks();
         Ok(Helper {
             index,
             wanted,
@@ -320,6 +438,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             should_match_threshold,
             bucket: HashSet::new(),
             results: HashMap::new(),
+            filter: filters.documents(index).map(Rc::new),
+            check_housenumber,
+            only_housenumber,
             order: Order::default(),
             trace: None,
         })
@@ -427,9 +548,19 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     }
 
     /// The best `limit` documents holding every key, by summed score; 100 if
-    /// `limit` is not positive (addok's `intersect`).
-    fn intersect(&mut self, keys: &[String], limit: i64) -> Vec<DocId> {
+    /// `limit` is not positive (addok's `intersect`). Keys given, the
+    /// filters' key joins them, in the caller's list too: addok extends the
+    /// list it is handed, and the collectors that hand it `helper.keys` keep
+    /// the filter key there, which then reaches fuzzy's pair lookups.
+    fn intersect(&mut self, keys: &mut Vec<String>, limit: i64) -> Vec<DocId> {
         let index = self.index;
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        let filter = self.filter.clone();
+        if filter.is_some() {
+            keys.push(FILTER_KEY.to_owned());
+        }
         let limit = match usize::try_from(limit) {
             Ok(limit) if limit > 0 => limit,
             _ => self.wanted.max(BUCKET_MAX),
@@ -439,6 +570,12 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         words.dedup();
         let mut lists = Vec::with_capacity(words.len());
         for word in words {
+            if word == FILTER_KEY
+                && let Some(filter) = &filter
+            {
+                lists.push(PostingList::set(filter));
+                continue;
+            }
             match index.postings(word) {
                 Some(list) => lists.push(list),
                 None => return Vec::new(),
@@ -467,23 +604,25 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         best
     }
 
-    fn add_to_bucket(&mut self, keys: &[String]) {
+    fn add_to_bucket(&mut self, keys: &mut Vec<String>) {
         self.debug(|_| format!("Adding to bucket with keys {}", self::keys(keys)));
-        self.matched_keys.extend(keys.iter().cloned());
+        let words = keys.iter().filter(|key| *key != FILTER_KEY);
+        self.matched_keys.extend(words.cloned());
         let limit = BUCKET_MAX as i64 - self.bucket.len() as i64;
         let found = self.intersect(keys, limit);
         self.bucket.extend(found);
         self.debug(|h| format!("{} ids in bucket so far", h.bucket.len()));
     }
 
-    fn new_bucket(&mut self, keys: &[String], limit: i64) {
+    fn new_bucket(&mut self, keys: &mut Vec<String>, limit: i64) {
         self.debug(|_| {
             format!(
                 "New bucket with keys {} and limit {limit}",
                 self::keys(keys)
             )
         });
-        self.matched_keys = keys.iter().cloned().collect();
+        let words = keys.iter().filter(|key| *key != FILTER_KEY);
+        self.matched_keys = words.cloned().collect();
         self.bucket = self.intersect(keys, limit).into_iter().collect();
         self.debug(|h| format!("{} ids in bucket so far", h.bucket.len()));
     }
@@ -498,21 +637,26 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             .filter(|doc| !self.results.contains_key(doc))
             .collect();
         for doc in new {
-            let scored = self.score(doc);
-            self.results.insert(doc, scored);
+            if let Some(scored) = self.score(doc) {
+                self.results.insert(doc, scored);
+            }
         }
     }
 
     /// A document's scores, through addok's `SEARCH_RESULT_PROCESSORS`: the
     /// house number matched, labels made, then scores for importance and
     /// for the best label. Read in place: only the results search returns
-    /// are made whole, by `result`.
-    fn score(&mut self, doc: DocId) -> Scored {
+    /// are made whole, by `result`. None for a document without the house
+    /// number when the `type` filter asks for house numbers only.
+    fn score(&mut self, doc: DocId) -> Option<Scored> {
         let index = self.index;
-        let number = match self.housenumber.is_empty() {
+        let number = match self.housenumber.is_empty() || !self.check_housenumber {
             true => None,
             false => index.housenumber_number(doc, &self.housenumber),
         };
+        if self.only_housenumber && number.is_none() {
+            return None;
+        }
         let kind = match number {
             Some(_) => "housenumber",
             None => index.kind(doc),
@@ -553,17 +697,17 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         }
         // addok sums its scores and their ceilings in this order.
         let score = (0.0 + importance + str_distance) / (0.0 + IMPORTANCE_WEIGHT + 1.0);
-        Scored {
+        Some(Scored {
             importance,
             str_distance,
             score,
-        }
+        })
     }
 
     /// A document `score` scored, made a result.
     fn result(&self, doc: DocId, scored: Scored) -> Found {
         let document = self.index.document(doc);
-        let housenumber = match self.housenumber.is_empty() {
+        let housenumber = match self.housenumber.is_empty() || !self.check_housenumber {
             true => None,
             false => self.index.housenumber(doc, &self.housenumber),
         };
@@ -594,29 +738,48 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         self.tokens.is_empty()
     }
 
-    /// addok's `only_commons` collector.
+    /// addok's `only_commons` collector. Its single key, once intersected,
+    /// holds the filter key too, and so counts as more than one.
     fn only_commons_collector(&mut self) -> bool {
         if !self.only_commons() {
             return false;
         }
-        let keys: Vec<String> = self
+        let mut keys: Vec<String> = self
             .tokens
             .iter()
             .map(|token| token.value.clone())
             .collect();
         if keys.len() == 1 {
-            self.add_to_bucket(&keys);
+            self.add_to_bucket(&mut keys);
         }
         if self.bucket_dry() && keys.len() > 1 {
             self.tokens.sort_by_key(|token| token.frequency);
-            let keys: Vec<String> = self
+            let mut keys: Vec<String> = self
                 .tokens
                 .iter()
                 .map(|token| token.value.clone())
                 .collect();
-            if self.tokens[0].frequency < INTERSECT_LIMIT {
+            let first = self.tokens[0].frequency;
+            let filter = self.filter.as_ref().map(|filter| filter.len());
+            if first < INTERSECT_LIMIT {
                 self.debug(|_| "Under INTERSECT_LIMIT, force intersect.".to_owned());
-                self.add_to_bucket(&keys);
+                self.add_to_bucket(&mut keys);
+            } else if let Some(filter) = filter {
+                let mut all_keys = keys.clone();
+                all_keys.push(FILTER_KEY.to_owned());
+                if filter < first {
+                    self.debug(|_| {
+                        format!("Filter ({filter}) more selective than token ({first}), use intersect")
+                    });
+                    self.add_to_bucket(&mut all_keys);
+                } else {
+                    self.debug(|_| {
+                        format!("Token ({first}) and filter ({filter}) both large, manual scan")
+                    });
+                    let found = self.manual_scan(&all_keys);
+                    self.bucket.extend(found);
+                    self.debug(|h| format!("{} results after scan", h.bucket.len()));
+                }
             } else {
                 self.debug(|h| {
                     format!(
@@ -633,19 +796,21 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     }
 
     /// addok's `manual_scan` script: of the first key's 501 best documents,
-    /// those every other key holds, up to `wanted`.
+    /// those every other key holds, up to `wanted`. The filter key's
+    /// documents are a set, as Redis's are.
     fn manual_scan(&mut self, keys: &[String]) -> Vec<DocId> {
         let index = self.index;
-        let lists: Vec<_> = keys.iter().map(|key| index.postings(key)).collect();
-        let Some(Some(first)) = lists.first().copied() else {
+        let filter = self.filter.clone();
+        let holds = |key: &String, doc: DocId| match (key == FILTER_KEY, &filter) {
+            (true, Some(filter)) => filter.binary_search(&doc).is_ok(),
+            _ => index.postings(key).is_some_and(|list| list.contains(doc)),
+        };
+        let Some(first) = keys.first().and_then(|key| index.postings(key)) else {
             return Vec::new();
         };
         let mut candidates = Vec::new();
         for (doc, _) in self.best(&[first], MANUAL_SCAN) {
-            if lists[1..]
-                .iter()
-                .all(|list| list.is_some_and(|list| list.contains(doc)))
-            {
+            if keys[1..].iter().all(|key| holds(key, doc)) {
                 candidates.push(doc);
             }
             if candidates.len() == self.wanted {
@@ -727,7 +892,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 self.debug(|_| format!("Trying to extend bucket. Autocomplete w|{word}"));
                 let mut extended = keys.clone();
                 extended.push(word.to_owned());
-                self.add_to_bucket(&extended);
+                self.add_to_bucket(&mut extended);
             }
         }
     }
@@ -736,7 +901,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         if self.meaningful.is_empty() {
             return false;
         }
-        if self.meaningful.len() == 1 && !self.common.is_empty() {
+        if self.meaningful.len() == 1 && !self.common.is_empty() && self.filter.is_none() {
             // One more token, so as not to search with too few.
             let other = self
                 .common
@@ -751,18 +916,21 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             .iter()
             .map(|token| token.value.clone())
             .collect();
-        let keys = self.keys.clone();
+        // Handed `helper.keys` itself, which keeps the filter key.
+        let mut keys = std::mem::take(&mut self.keys);
         if self.bucket_empty() {
-            self.new_bucket(&keys, BUCKET_MIN as i64);
+            self.new_bucket(&mut keys, BUCKET_MIN as i64);
             if self.bucket.len() == BUCKET_MIN {
-                self.new_bucket(&keys, 0);
+                self.new_bucket(&mut keys, 0);
             }
+            self.keys = keys;
             if self.has_cream() && self.cream() < BUCKET_MIN {
                 self.debug(|_| "Cream found. Returning.".to_owned());
                 return true;
             }
         } else {
-            self.add_to_bucket(&keys);
+            self.add_to_bucket(&mut keys);
+            self.keys = keys;
         }
         false
     }
@@ -780,8 +948,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                     .iter()
                     .map(|token| token.value.clone())
                     .collect();
-                let keys = self.keys.clone();
-                self.new_bucket(&keys, 0);
+                let mut keys = std::mem::take(&mut self.keys);
+                self.new_bucket(&mut keys, 0);
+                self.keys = keys;
             }
         }
         false
@@ -872,7 +1041,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 if self.bucket_dry() {
                     let mut extended = keys.clone();
                     extended.push(word);
-                    self.add_to_bucket(&extended);
+                    self.add_to_bucket(&mut extended);
                 }
             }
         }
@@ -897,8 +1066,8 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         let rank = |token: &Token| words.iter().position(|word| *word == token.value);
         tokens.sort_by_key(|token| rank(token).unwrap_or(words.len()));
         let mut overflow = false;
-        for relation in self.relations(&tokens) {
-            self.add_to_bucket(&relation);
+        for mut relation in self.relations(&tokens) {
+            self.add_to_bucket(&mut relation);
             if self.bucket_overflow() {
                 overflow = true;
                 break;
@@ -981,8 +1150,8 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             self.meaningful.sort_by_key(|token| Reverse(order(token)));
             let meaningful = self.meaningful.clone();
             for token in &meaningful {
-                let keys = without(&self.keys, &[&token.value]);
-                self.add_to_bucket(&keys);
+                let mut keys = without(&self.keys, &[&token.value]);
+                self.add_to_bucket(&mut keys);
                 if self.bucket_overflow() {
                     break;
                 }
@@ -992,8 +1161,8 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 'pairs: for token in &meaningful {
                     for other in &meaningful {
                         if token.value != other.value {
-                            let keys = without(&self.keys, &[&token.value, &other.value]);
-                            self.add_to_bucket(&keys);
+                            let mut keys = without(&self.keys, &[&token.value, &other.value]);
+                            self.add_to_bucket(&mut keys);
                             if self.bucket_overflow() {
                                 break 'pairs;
                             }
@@ -1315,6 +1484,73 @@ mod tests {
         );
     }
 
+    /// Two streets of one name in two communes, the first with a house
+    /// number 4.
+    fn two_communes() -> Index<crate::index::AlignedBytes> {
+        let street = |id: &str, citycode: &str, postcode: &str, city: &str, numbers: &str| {
+            Document::from_ndjson(&format!(
+                r#"{{"id":"{id}","banId":null,"type":"street","name":"Rue Lima","postcode":"{postcode}","citycode":"{citycode}","city":"{city}","context":"","x":0,"y":0,"lon":2.3,"lat":48.8,"importance":0.5,"housenumbers":{{{numbers}}}}}"#
+            ))
+            .unwrap()
+        };
+        let four = r#""4":{"id":"75101_0001_00004","banId":null,"x":0,"y":0,"lon":2.3,"lat":48.8}"#;
+        let streets = [
+            street("75101_0001", "75101", "75001", "Paris", four),
+            street("69381_0001", "69381", "69001", "Lyon", ""),
+        ];
+        let mut bytes = crate::index::AlignedBytes::default();
+        crate::index::write(streets, &mut bytes).unwrap();
+        Index::open(bytes).unwrap()
+    }
+
+    fn ids(found: &[Found]) -> Vec<&str> {
+        found.iter().map(Found::id).collect()
+    }
+
+    fn filters(kind: &[&str], citycode: &[&str], postcode: &[&str]) -> Filters {
+        let owned = |values: &[&str]| values.iter().map(|value| value.to_string()).collect();
+        Filters {
+            kind: owned(kind),
+            citycode: owned(citycode),
+            postcode: owned(postcode),
+        }
+    }
+
+    #[test]
+    fn keeps_only_the_documents_a_filter_holds() {
+        let index = two_communes();
+        let search = |filters: &Filters| search_filtered(&index, "rue lima", 3, filters).unwrap();
+        assert_eq!(ids(&search(&Filters::default())).len(), 2);
+        assert_eq!(ids(&search(&filters(&[], &[], &["69001"]))), ["69381_0001"]);
+        assert_eq!(ids(&search(&filters(&[], &["75101"], &[]))), ["75101_0001"]);
+        // Several values of a filter: any of them.
+        assert_eq!(ids(&search(&filters(&[], &[], &["69001", "75001"]))).len(), 2);
+        // Several filters: all of them.
+        assert!(search(&filters(&[], &["75101"], &["69001"])).is_empty());
+        // A value no document holds matches nothing.
+        assert!(search(&filters(&[], &[], &["13001"])).is_empty());
+        // Values trimmed, empty ones dropped, as addok does.
+        assert_eq!(ids(&search(&filters(&[], &[], &[" 69001 ", ""]))), ["69381_0001"]);
+    }
+
+    #[test]
+    fn matches_house_numbers_as_the_type_filter_says() {
+        let index = two_communes();
+        let search = |query: &str, filters: &Filters| search_filtered(&index, query, 3, filters).unwrap();
+        let paris = filters(&[], &["75101"], &[]);
+        assert_eq!(search("4 rue lima", &paris)[0].kind(), "housenumber");
+        // A street filter leaves the house number aside.
+        let street = filters(&["street"], &["75101"], &[]);
+        assert_eq!(search("4 rue lima", &street)[0].kind(), "street");
+        // House numbers only: a street without the number is no result.
+        let housenumber = filters(&["housenumber"], &[], &[]);
+        assert_eq!(ids(&search("4 rue lima", &housenumber)), ["75101_0001_00004"]);
+        assert!(search("9 rue lima", &housenumber).is_empty());
+        // House numbers among other types: matched, but not required.
+        let either = filters(&["housenumber", "street"], &[], &[]);
+        assert_eq!(search("9 rue lima", &either).len(), 2);
+    }
+
     // The orders below are addok-rs's own, on small indexes of its own.
 
     /// Streets of these names, numbered as listed: ids of three digits
@@ -1337,7 +1573,7 @@ mod tests {
         // hundred: the order picks the two it drops.
         let index = index(&["Lima"; 102]);
         let ids = |order: &Order| {
-            let (found, trace) = search_traced(&index, "lima", 3, order).unwrap();
+            let (found, trace) = search_traced(&index, "lima", 3, &Filters::default(), order).unwrap();
             assert_eq!(trace.tied.len(), 102);
             let ids: Vec<String> = found.iter().map(|found| found.id().to_owned()).collect();
             ids
@@ -1356,7 +1592,7 @@ mod tests {
         // so a token joins the group of whichever neighbour comes first.
         let index = index(&["Lima Oslo", "Oslo Rome", "Rome Kiev", "Kiev Lima"]);
         let groups = |order: &Order| {
-            let (_, trace) = search_traced(&index, "lima oslo rome kiev", 3, order).unwrap();
+            let (_, trace) = search_traced(&index, "lima oslo rome kiev", 3, &Filters::default(), order).unwrap();
             let steps = trace.steps.into_iter();
             let keys = steps.filter_map(|step| {
                 let keys = step.strip_prefix("Adding to bucket with keys ");

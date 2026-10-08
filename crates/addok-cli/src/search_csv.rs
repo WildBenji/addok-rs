@@ -5,9 +5,10 @@
 //! reproduced: a dialect its Sniffer guesses wrong, an
 //! empty `result_street` column, and a request failed
 //! whole for one query over addok's length limit, whose row is answered
-//! empty and reported instead (`Warning`). Filters and the
-//! `lat`/`lon` columns are refused: addok-csv 1.1.0 fails on filters, and
-//! geohashes are not ported yet. Two departures from addok are asked for
+//! empty and reported instead (`Warning`). Filters name columns, whose value
+//! filters each row, as addok-csv means them; addok-csv 1.1.0 fails on them
+//! instead. The `lat`/`lon` columns are refused: geohashes are not ported
+//! yet. Two departures from addok are asked for
 //! per request: the postcode fallback, and the house number split into
 //! columns a client names in `result_columns`.
 
@@ -17,7 +18,7 @@ use std::fmt;
 use addok_core::document::Number;
 use addok_core::index::Index;
 
-use crate::geocoded::{Geocoded, MIN_SCORE, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
+use crate::geocoded::{FilterColumns, Geocoded, MIN_SCORE, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
 use crate::pycsv::{self, Dialect};
 
 /// A `/search/csv` request: its multipart form.
@@ -91,7 +92,7 @@ pub fn flag(value: &str) -> Option<bool> {
 pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result<Response, Error> {
     let bad = |title: String| Err(Error::BadRequest(title));
     let param = |name: &str| request.params.get(name).and_then(|values| values.last());
-    for name in ["type", "citycode", "postcode", "lat", "lon"] {
+    for name in ["lat", "lon"] {
         if request.params.contains_key(name) {
             return bad(format!("Unsupported parameter \"{name}\""));
         }
@@ -143,7 +144,8 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         Some(columns) => columns.clone(),
         None => fieldnames.clone(),
     };
-    if let Some(missing) = columns.iter().find(|column| !fieldnames.contains(column)) {
+    let filter_columns = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
+    if let Some(missing) = columns.iter().chain(filter_columns.columns()).find(|column| !fieldnames.contains(column)) {
         let fieldnames: Vec<String> = fieldnames.iter().map(|name| python_str(name)).collect();
         let fieldnames = fieldnames.join(", ");
         return bad(format!("Cannot found column '{missing}' in columns [{fieldnames}]"));
@@ -171,7 +173,8 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         let query = columns.iter().map(|column| value(column)).collect::<Vec<_>>().join(" ");
         // addok-csv fails the whole request on a query over addok's limit
         // (HTTP 413); the row is answered empty instead, and reported.
-        let geocoded = geocode(index, &query, min_score, postcode_fallback).unwrap_or_else(|_| {
+        let filters = filter_columns.filters(value);
+        let geocoded = geocode(index, &query, &filters, min_score, postcode_fallback).unwrap_or_else(|_| {
             too_long.push(i + 1);
             None
         });
@@ -477,5 +480,46 @@ mod tests {
         assert_eq!(split[1], format!("{};12;b", before[1]));
         assert_eq!(split[2], format!("{};4;", before[2]));
         assert_eq!(split[3], format!("{};;", before[3]));
+    }
+
+    #[test]
+    fn filters_each_row_by_the_columns_named() {
+        use addok_core::document::Document;
+        use addok_core::index::{AlignedBytes, write};
+        let street = |id: &str, postcode: &str, city: &str| {
+            format!(
+                r#"{{"id":"{id}","banId":null,"name":"Rue Clément Marot","postcode":"{postcode}","citycode":["{}"],"oldcitycode":null,"lon":2.89,"lat":42.69,"x":0,"y":0,"city":["{city}"],"oldcity":null,"context":"","type":"street","importance":0.5}}"#,
+                &id[..5]
+            )
+        };
+        let streets = [street("66136_0001", "66000", "Perpignan"), street("69381_0001", "69001", "Lyon")];
+        let mut bytes = AlignedBytes::default();
+        write(streets.map(|line| Document::from_ndjson(&line).unwrap()), &mut bytes).unwrap();
+        let index = Index::open(bytes).unwrap();
+        let csv = "q;cp\nRUE CLEMENT MAROT;69001\nRUE CLEMENT MAROT;13001\nRUE CLEMENT MAROT;\n";
+        let request = |params: &[(&str, &str)]| {
+            let mut request = Request {
+                data: csv.as_bytes().to_vec(),
+                filename: "addresses.csv".into(),
+                ..Request::default()
+            };
+            request.params.insert("columns".into(), vec!["q".into()]);
+            for &(name, value) in params {
+                request.params.entry(name.into()).or_default().push(value.into());
+            }
+            request
+        };
+        let body = search_csv(&index, &request(&[("postcode", "cp")])).unwrap().body;
+        let lines: Vec<String> = String::from_utf8(body).unwrap().lines().map(str::to_owned).collect();
+        assert!(lines[1].contains("69381_0001"), "{}", lines[1]);
+        // A postcode no street holds: no result. An empty cell: no filter.
+        assert!(!lines[2].contains("_0001"), "{}", lines[2]);
+        assert!(lines[3].contains("_0001"), "{}", lines[3]);
+        // A column the file lacks is refused, as a missing query column is.
+        let refused = search_csv(&index, &request(&[("postcode", "zip")]));
+        assert!(matches!(refused, Err(Error::BadRequest(title)) if title.starts_with("Cannot found column 'zip'")));
+        // Positions are not ported yet.
+        let refused = search_csv(&index, &request(&[("lat", "lat")]));
+        assert!(matches!(refused, Err(Error::BadRequest(title)) if title == "Unsupported parameter \"lat\""));
     }
 }

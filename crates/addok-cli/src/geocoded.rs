@@ -3,7 +3,7 @@
 
 use addok_core::document::{Document, Number, Text};
 use addok_core::index::Index;
-use addok_core::search::{Found, search};
+use addok_core::search::{Filters, Found, search, search_filtered};
 use addok_core::text::{QUERY_MAX_LENGTH, QueryTooLong, fold, is_street_type, short_ordinal};
 
 /// addok-csv's `CSV_MIN_SCORE`.
@@ -22,6 +22,52 @@ pub enum Warning {
     /// request instead (HTTP 413): a single row of junk then cost a client's
     /// 999 other rows their answers.
     QueryTooLong { rows: Vec<usize> },
+}
+
+/// The columns whose values filter each row's search, by filter: addok-csv's
+/// `type`, `citycode` and `postcode` fields, each naming columns, not
+/// values. addok-csv 1.1.0 fails on them with addok 1.3.2, which hands it
+/// the names as a list; the intent is kept, one column or several.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterColumns {
+    pub kind: Vec<String>,
+    pub citycode: Vec<String>,
+    pub postcode: Vec<String>,
+}
+
+impl FilterColumns {
+    /// The filters' columns by name, as addok's HTTP layer reads a filter's
+    /// values: each given value split on spaces.
+    pub fn named<'a>(named: impl Fn(&str) -> Option<&'a [String]>) -> Self {
+        let columns = |name: &str| {
+            let values = named(name).unwrap_or_default().iter();
+            values.flat_map(|value| value.split(' ')).filter(|column| !column.is_empty()).map(str::to_owned).collect()
+        };
+        FilterColumns {
+            kind: columns("type"),
+            citycode: columns("citycode"),
+            postcode: columns("postcode"),
+        }
+    }
+
+    /// Every column named, filter by filter.
+    pub fn columns(&self) -> impl Iterator<Item = &String> {
+        self.kind.iter().chain(&self.citycode).chain(&self.postcode)
+    }
+
+    /// A row's filters, from its value in each column: an empty cell filters
+    /// nothing, as an empty value does on addok's `/search`.
+    pub fn filters<'v>(&self, value: impl Fn(&str) -> &'v str) -> Filters {
+        let values = |columns: &[String]| {
+            let values = columns.iter().map(|column| value(column).trim());
+            values.filter(|value| !value.is_empty()).map(str::to_owned).collect()
+        };
+        Filters {
+            kind: values(&self.kind),
+            citycode: values(&self.citycode),
+            postcode: values(&self.postcode),
+        }
+    }
 }
 
 /// How many row numbers a warning's header lists; its count says how many
@@ -111,17 +157,18 @@ pub fn split_housenumber(housenumber: &str) -> [Option<String>; 3] {
     [some(num), some(complement), some(&short)]
 }
 
-/// addok-csv's `process_row`: the query's best result, unless its rounded
-/// score is not above `min_score`. With `postcode_fallback`, asked for, the
-/// one departure from it.
+/// addok-csv's `process_row`: the query's best result among the documents
+/// the filters hold, unless its rounded score is not above `min_score`. With
+/// `postcode_fallback`, asked for, the one departure from it.
 pub fn geocode<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
+    filters: &Filters,
     min_score: f64,
     postcode_fallback: bool,
 ) -> Result<Option<Geocoded>, QueryTooLong> {
-    let mut found = search(index, query, 3)?;
-    if postcode_fallback && let Some(rescued) = self::postcode_fallback(index, query, &found)? {
+    let mut found = search_filtered(index, query, 3, filters)?;
+    if postcode_fallback && let Some(rescued) = self::postcode_fallback(index, query, filters, &found)? {
         found = rescued;
     }
     let best = found.first().filter(|best| round(best.score) > min_score);
@@ -133,10 +180,12 @@ pub fn geocode<B: AsRef<[u8]>>(
 /// answer, the results of the query without it, if their best is a
 /// confident house number in a commune the query names. A city's postcode
 /// with the wrong district (Perpignan 66100 for a street of 66000)
-/// otherwise outranks the right street.
+/// otherwise outranks the right street. The filters hold for the second
+/// search too: they bound what a client accepts.
 pub fn postcode_fallback<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
+    filters: &Filters,
     found: &[Found],
 ) -> Result<Option<Vec<Found>>, QueryTooLong> {
     if found.first().is_some_and(confident) || !worth_retrying(index, found.first(), query) {
@@ -145,7 +194,7 @@ pub fn postcode_fallback<B: AsRef<[u8]>>(
     let Some(without) = without_postcode(query) else {
         return Ok(None);
     };
-    let retried = search(index, &without, 3)?;
+    let retried = search_filtered(index, &without, 3, filters)?;
     let Some(best) = retried.first().filter(|best| confident(best) && named_in(&best.document, query)) else {
         return Ok(None);
     };
@@ -411,9 +460,9 @@ mod tests {
         ]);
         // Fayet of the Aisne exists: 02100 is its postcode, not a mistake for
         // Fayet of Aveyron, so the rescue is dropped.
-        assert!(postcode_fallback(&index, "4 RUE DE LA COTE FAYET 02100", &[]).unwrap().is_none());
+        assert!(postcode_fallback(&index, "4 RUE DE LA COTE FAYET 02100", &Filters::default(), &[]).unwrap().is_none());
         // No Fayet in the Alpes-Maritimes: the postcode is the mistake.
-        let rescued = postcode_fallback(&index, "4 RUE DE LA COTE FAYET 06700", &[]).unwrap().unwrap();
+        let rescued = postcode_fallback(&index, "4 RUE DE LA COTE FAYET 06700", &Filters::default(), &[]).unwrap().unwrap();
         assert_eq!(rescued[0].label(), "4 Rue de la Côte 12360 Fayet");
     }
 
@@ -431,10 +480,10 @@ mod tests {
         // 66000 the query names; two streets cannot, so the first pass is
         // given as found nothing.
         let index = perpignan();
-        let rescued = postcode_fallback(&index, "4 RUE CLEMENT MAROT PERPIGNAN 66100", &[]).unwrap().unwrap();
+        let rescued = postcode_fallback(&index, "4 RUE CLEMENT MAROT PERPIGNAN 66100", &Filters::default(), &[]).unwrap().unwrap();
         assert_eq!(rescued[0].label(), "4 Rue Clément Marot 66000 Perpignan");
         // Not in a commune the query names: the first answer stands.
-        assert!(postcode_fallback(&index, "4 RUE CLEMENT MAROT CANET 66140", &[]).unwrap().is_none());
+        assert!(postcode_fallback(&index, "4 RUE CLEMENT MAROT CANET 66140", &Filters::default(), &[]).unwrap().is_none());
     }
 
     #[test]
@@ -459,7 +508,7 @@ mod tests {
         let query = "4 RUE CLEMENT MAROT PERPIGNAN 66100";
         let found = search(&index, query, 3).unwrap();
         assert!(confident(&found[0]));
-        assert!(postcode_fallback(&index, query, &found).unwrap().is_none());
+        assert!(postcode_fallback(&index, query, &Filters::default(), &found).unwrap().is_none());
     }
 
     #[test]

@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.8.0 — 2026-10-08
+
+addok's filters, at parity with addok 1.3.2, on every interface.
+
+### Features
+
+- **addok's filters:** `type`, `citycode` and `postcode`, several values of one filter meaning any of them, several filters all of them.
+  - **Search:** `addok_core::search::search_filtered`, and `Filters`. Under filters, search answers as addok 1.3.2 does, quirks included: a filter scores 1 in intersections, as a Redis set does, and once set it keeps fuzzy matching from suggesting words.
+  - **`type` decides the house number:** `housenumber` alone keeps only results with the query's number; other types alone leave the number aside.
+  - **`/search/csv`, `/batch` and `addok-cli batch`:** a filter names a column, whose value filters each row (`-F postcode=zip_code`, `--filters postcode=zip_code`), as addok-csv means it. addok-csv 1.1.0 fails on filters with addok 1.3.2. An empty cell filters nothing; a column the file lacks is refused.
+  - **The postcode fallback keeps the filters** in its second search.
+  - **Measured:** 99.87% of 540,226 filtered searches on real addresses answer as addok's, score included; every other one ties or is explained by the orders addok leaves to chance. Throughput stays within 10% of unfiltered search.
+
+### Changed
+
+- **`addok_core::search::search_traced`** takes the filters.
+- **`/search/csv` no longer refuses `type`, `citycode` and `postcode`;** `lat` and `lon` still are.
+
 ## v0.7.0 — 2026-10-08
 
 The first public release.
