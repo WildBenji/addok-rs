@@ -1,0 +1,6 @@
+# Only what the image builds from: target/ alone weighs
+# gigabytes.
+*
+!Cargo.toml
+!Cargo.lock
+!crates
