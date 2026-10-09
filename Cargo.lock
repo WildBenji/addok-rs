@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "addok-cli"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "addok-core",
  "arrow",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "addok-core"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "bytemuck",
  "deunicode",

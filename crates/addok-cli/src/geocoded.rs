@@ -3,8 +3,10 @@
 
 use addok_core::document::{Document, Number, Text};
 use addok_core::index::Index;
-use addok_core::search::{Filters, Found, search, search_filtered};
+use addok_core::search::{Center, Filters, Found, Options, search, search_with};
 use addok_core::text::{QUERY_MAX_LENGTH, QueryTooLong, fold, is_street_type, short_ordinal};
+
+use crate::search_csv::flag;
 
 /// addok-csv's `CSV_MIN_SCORE`.
 pub const MIN_SCORE: f64 = 0.5;
@@ -67,6 +69,86 @@ impl FilterColumns {
             citycode: values(&self.citycode),
             postcode: values(&self.postcode),
         }
+    }
+}
+
+/// The columns whose values give each row a position to search around:
+/// addok-csv's `lat` and `lon` fields, each naming a column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionColumns {
+    pub lat: String,
+    pub lon: String,
+}
+
+impl PositionColumns {
+    /// The columns a request names, both or none: addok-csv's `lat` and
+    /// `lon`. addok-csv ignores one without the other; it is refused.
+    pub fn named(lat: Option<&str>, lon: Option<&str>) -> Result<Option<Self>, String> {
+        match (lat, lon) {
+            (Some(lat), Some(lon)) => Ok(Some(PositionColumns { lat: lat.to_owned(), lon: lon.to_owned() })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("\"lat\" names a column without \"lon\"".into()),
+            (None, Some(_)) => Err("\"lon\" names a column without \"lat\"".into()),
+        }
+    }
+
+    /// A row's position, from its value in each column: none if either
+    /// cell is empty, as addok-csv reads them; an error naming the value
+    /// if it is not a number, or not a latitude python-geohash takes, where
+    /// addok-csv fails the whole request.
+    pub fn center<'v>(&self, value: impl Fn(&str) -> &'v str) -> Result<Option<Center>, String> {
+        let (lat, lon) = (value(&self.lat), value(&self.lon));
+        if lat.is_empty() || lon.is_empty() {
+            return Ok(None);
+        }
+        let number = |column: &str, cell: &str| {
+            python_float(cell).ok_or_else(|| format!("invalid number {cell:?} in column \"{column}\""))
+        };
+        let center = Center { lat: number(&self.lat, lat)?, lon: number(&self.lon, lon)? };
+        if !(-90.0..90.0).contains(&center.lat) {
+            return Err(format!("latitude {lat:?} out of range in column \"{}\"", self.lat));
+        }
+        Ok(Some(center))
+    }
+}
+
+/// The radius `nearest` searches within unless told, in metres.
+pub const NEAREST_RADIUS: f64 = 5000.0;
+/// The widest radius `nearest` takes: a position far from any address
+/// explores every cell within it.
+pub const NEAREST_RADIUS_MAX: f64 = 10_000.0;
+
+/// Not addok's: reverse's search for the nearest addresses within a radius,
+/// asked for with `nearest`, the radius with `radius` in metres. Read from
+/// a request's last value of each, by name: none without `nearest` on, an
+/// error for a value it cannot take.
+pub fn nearest_radius<'v>(param: impl Fn(&str) -> Option<&'v str>) -> Result<Option<f64>, String> {
+    let nearest = match param("nearest") {
+        None => false,
+        Some(value) => flag(value).ok_or(format!("invalid \"nearest\": {value}"))?,
+    };
+    match (nearest, param("radius")) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err("\"radius\" goes with \"nearest\"".into()),
+        (true, None) => Ok(Some(NEAREST_RADIUS)),
+        (true, Some(value)) => match python_float(value) {
+            Some(radius) if radius > 0.0 && radius <= NEAREST_RADIUS_MAX => Ok(Some(radius)),
+            _ => Err(format!("invalid \"radius\": {value}, metres from 0 to {NEAREST_RADIUS_MAX}")),
+        },
+    }
+}
+
+/// Python's `float()` of a string: blanks around, digits that single
+/// underscores may group, `inf` and `nan` in any case.
+pub fn python_float(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let grouped = bytes.iter().enumerate().all(|(i, &byte)| {
+        byte != b'_' || (i > 0 && bytes[i - 1].is_ascii_digit() && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    });
+    match grouped {
+        true => value.replace('_', "").parse().ok(),
+        false => None,
     }
 }
 
@@ -158,17 +240,20 @@ pub fn split_housenumber(housenumber: &str) -> [Option<String>; 3] {
 }
 
 /// addok-csv's `process_row`: the query's best result among the documents
-/// the filters hold, unless its rounded score is not above `min_score`. With
-/// `postcode_fallback`, asked for, the one departure from it.
+/// the filters hold, around the row's position if it has one, unless its
+/// rounded score is not above `min_score`. With `postcode_fallback`, asked
+/// for, the one departure from it.
 pub fn geocode<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
     filters: &Filters,
+    center: Option<Center>,
     min_score: f64,
     postcode_fallback: bool,
 ) -> Result<Option<Geocoded>, QueryTooLong> {
-    let mut found = search_filtered(index, query, 3, filters)?;
-    if postcode_fallback && let Some(rescued) = self::postcode_fallback(index, query, filters, &found)? {
+    let options = Options { limit: 3, autocomplete: false, filters: filters.clone(), center };
+    let mut found = search_with(index, query, &options)?;
+    if postcode_fallback && let Some(rescued) = self::postcode_fallback(index, query, &options, &found)? {
         found = rescued;
     }
     let best = found.first().filter(|best| round(best.score) > min_score);
@@ -180,12 +265,12 @@ pub fn geocode<B: AsRef<[u8]>>(
 /// answer, the results of the query without it, if their best is a
 /// confident house number in a commune the query names. A city's postcode
 /// with the wrong district (Perpignan 66100 for a street of 66000)
-/// otherwise outranks the right street. The filters hold for the second
-/// search too: they bound what a client accepts.
+/// otherwise outranks the right street. The filters and the position hold
+/// for the second search too: they bound what a client accepts.
 pub fn postcode_fallback<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
-    filters: &Filters,
+    options: &Options,
     found: &[Found],
 ) -> Result<Option<Vec<Found>>, QueryTooLong> {
     if found.first().is_some_and(confident) || !worth_retrying(index, found.first(), query) {
@@ -194,7 +279,7 @@ pub fn postcode_fallback<B: AsRef<[u8]>>(
     let Some(without) = without_postcode(query) else {
         return Ok(None);
     };
-    let retried = search_filtered(index, &without, 3, filters)?;
+    let retried = search_with(index, &without, options)?;
     let Some(best) = retried.first().filter(|best| confident(best) && named_in(&best.document, query)) else {
         return Ok(None);
     };
@@ -403,10 +488,33 @@ mod tests {
         .unwrap()
     }
 
+    /// addok-csv's search: three results, no filter, no position.
+    fn three() -> Options {
+        Options { limit: 3, ..Options::default() }
+    }
+
     fn index(documents: Vec<Document>) -> Index<AlignedBytes> {
         let mut bytes = AlignedBytes::default();
         write(documents, &mut bytes).unwrap();
         Index::open(bytes).unwrap()
+    }
+
+    #[test]
+    fn reads_nearest_and_its_radius() {
+        let read = |pairs: &[(&str, &str)]| {
+            let param = |name: &str| pairs.iter().rev().find(|(key, _)| *key == name).map(|(_, value)| *value);
+            nearest_radius(param)
+        };
+        assert_eq!(read(&[]), Ok(None));
+        assert_eq!(read(&[("nearest", "0")]), Ok(None));
+        assert_eq!(read(&[("nearest", "1")]), Ok(Some(NEAREST_RADIUS)));
+        assert_eq!(read(&[("nearest", "on"), ("radius", "250")]), Ok(Some(250.0)));
+        assert_eq!(read(&[("nearest", "1"), ("radius", "10000")]), Ok(Some(10_000.0)));
+        assert!(read(&[("nearest", "1"), ("radius", "10001")]).is_err());
+        assert!(read(&[("nearest", "1"), ("radius", "0")]).is_err());
+        assert!(read(&[("nearest", "1"), ("radius", "far")]).is_err());
+        assert!(read(&[("nearest", "maybe")]).is_err());
+        assert_eq!(read(&[("radius", "300")]), Err("\"radius\" goes with \"nearest\"".into()));
     }
 
     #[test]
@@ -455,9 +563,9 @@ mod tests {
         ]);
         // Fayet of the Aisne exists: 02100 is its postcode, not a mistake for
         // Fayet of Aveyron, so the rescue is dropped.
-        assert!(postcode_fallback(&index, "4 RUE DE LA COTE FAYET 02100", &Filters::default(), &[]).unwrap().is_none());
+        assert!(postcode_fallback(&index, "4 RUE DE LA COTE FAYET 02100", &three(), &[]).unwrap().is_none());
         // No Fayet in the Alpes-Maritimes: the postcode is the mistake.
-        let rescued = postcode_fallback(&index, "4 RUE DE LA COTE FAYET 06700", &Filters::default(), &[]).unwrap().unwrap();
+        let rescued = postcode_fallback(&index, "4 RUE DE LA COTE FAYET 06700", &three(), &[]).unwrap().unwrap();
         assert_eq!(rescued[0].label(), "4 Rue de la Côte 12360 Fayet");
     }
 
@@ -475,10 +583,10 @@ mod tests {
         // 66000 the query names; two streets cannot, so the first pass is
         // given as found nothing.
         let index = perpignan();
-        let rescued = postcode_fallback(&index, "4 RUE CLEMENT MAROT PERPIGNAN 66100", &Filters::default(), &[]).unwrap().unwrap();
+        let rescued = postcode_fallback(&index, "4 RUE CLEMENT MAROT PERPIGNAN 66100", &three(), &[]).unwrap().unwrap();
         assert_eq!(rescued[0].label(), "4 Rue Clément Marot 66000 Perpignan");
         // Not in a commune the query names: the first answer stands.
-        assert!(postcode_fallback(&index, "4 RUE CLEMENT MAROT CANET 66140", &Filters::default(), &[]).unwrap().is_none());
+        assert!(postcode_fallback(&index, "4 RUE CLEMENT MAROT CANET 66140", &three(), &[]).unwrap().is_none());
     }
 
     #[test]
@@ -503,7 +611,7 @@ mod tests {
         let query = "4 RUE CLEMENT MAROT PERPIGNAN 66100";
         let found = search(&index, query, 3).unwrap();
         assert!(confident(&found[0]));
-        assert!(postcode_fallback(&index, query, &Filters::default(), &found).unwrap().is_none());
+        assert!(postcode_fallback(&index, query, &three(), &found).unwrap().is_none());
     }
 
     #[test]

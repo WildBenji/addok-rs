@@ -1,5 +1,6 @@
 //! addok-csv 1.1.0's `/search/csv` (its `CSVSearch`), on addok-rs's search:
-//! a CSV file in, the same file out with the best result of each row. The
+//! a CSV file in, the same file out with the best result of each row; and
+//! its `/reverse/csv` (`CSVReverse`), each row's nearest address. The
 //! response is addok-csv's, byte for byte, but where search answers
 //! otherwise and for three bugs of addok-csv's, fixed rather than
 //! reproduced: a dialect its Sniffer guesses wrong, an
@@ -7,18 +8,25 @@
 //! whole for one query over addok's length limit, whose row is answered
 //! empty and reported instead (`Warning`). Filters name columns, whose value
 //! filters each row, as addok-csv means them; addok-csv 1.1.0 fails on them
-//! instead. The `lat`/`lon` columns are refused: geohashes are not ported
-//! yet. Two departures from addok are asked for
-//! per request: the postcode fallback, and the house number split into
-//! columns a client names in `result_columns`.
+//! instead. `lat` and `lon` name the columns of each row's position, as in
+//! addok-csv; one without the other, a column the file lacks or a value
+//! that is not a number is refused, where addok-csv ignores the first two
+//! and fails on the third. Two departures from addok are asked for per
+//! request: the postcode fallback, and the house number split into columns
+//! a client names in `result_columns`.
 
 use std::collections::HashMap;
 use std::fmt;
 
-use addok_core::document::Number;
+use addok_core::document::{Number, Text};
+use addok_core::reverse::{reverse, reverse_nearest};
+use addok_core::search::{Center, Found};
 use addok_core::index::Index;
 
-use crate::geocoded::{FilterColumns, Geocoded, MIN_SCORE, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
+use crate::geocoded::{nearest_radius, python_float as read_float};
+use crate::geocoded::{
+    FilterColumns, Geocoded, MIN_SCORE, PositionColumns, SPLIT_COLUMNS, Warning, geocode, split_housenumber,
+};
 use crate::pycsv::{self, Dialect};
 
 /// A `/search/csv` request: its multipart form.
@@ -103,29 +111,7 @@ pub fn param_flag(value: &str) -> Option<bool> {
 pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result<Response, Error> {
     let bad = |title: String| Err(Error::BadRequest(title));
     let param = |name: &str| request.params.get(name).and_then(|values| values.last());
-    for name in ["lat", "lon"] {
-        if request.params.contains_key(name) {
-            return bad(format!("Unsupported parameter \"{name}\""));
-        }
-    }
-    let encoding = param("encoding").map_or("utf-8-sig", String::as_str);
-    let with_signature = match encoding.to_lowercase().replace('-', "_").as_str() {
-        "utf_8" | "utf8" | "u8" | "utf" => false,
-        "utf_8_sig" | "utf8_sig" => true,
-        _ => return bad(format!("Unable to decode with encoding \"{encoding}\"")),
-    };
-    let Ok(text) = std::str::from_utf8(&request.data) else {
-        return bad(format!("Unable to decode with encoding \"{encoding}\""));
-    };
-    let text = match with_signature {
-        true => text.strip_prefix('\u{feff}').unwrap_or(text),
-        false => text,
-    };
-    // addok-csv's line breaks, as per RFC 4180.
-    let content = text.replace('\r', "").replace('\n', "\r\n");
-    if content.is_empty() {
-        return bad("Empty file".into());
-    }
+    let (encoding, with_signature, content) = decode(request)?;
     let dialect = dialect(&content, param("delimiter"), param("quote"))?;
     let min_score = match param("min_score") {
         None => MIN_SCORE,
@@ -134,11 +120,7 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
             Err(_) => return bad(format!("Invalid parameter \"min_score\": {value}")),
         },
     };
-    let with_bom = match param("with_bom").map(|value| param_flag(value).ok_or(value)) {
-        None => false,
-        Some(Ok(on)) => on,
-        Some(Err(value)) => return bad(format!("Invalid parameter \"with_bom\": {value}")),
-    };
+    let with_bom = with_bom(request)?;
     // Not addok-csv's: the postcode fallback, off unless asked for.
     let postcode_fallback = match param("postcode_fallback").map(|value| flag(value).ok_or(value)) {
         None => false,
@@ -146,21 +128,14 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         Some(Err(value)) => return bad(format!("Invalid parameter \"postcode_fallback\": {value}")),
     };
 
-    let requested = request.params.get("columns").filter(|columns| !columns.is_empty());
-    let quote = param("quote").and_then(|quote| quote.chars().next());
-    let (dialect, records) = read(&content, dialect, requested, quote);
-    let mut records = records.into_iter();
-    let fieldnames = records.next().unwrap_or_default();
-    let columns = match requested {
-        Some(columns) => columns.clone(),
-        None => fieldnames.clone(),
-    };
+    let (dialect, fieldnames, records, columns) = table(request, &content, dialect);
     let filter_columns = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
-    if let Some(missing) = columns.iter().chain(filter_columns.columns()).find(|column| !fieldnames.contains(column)) {
-        let fieldnames: Vec<String> = fieldnames.iter().map(|name| python_str(name)).collect();
-        let fieldnames = fieldnames.join(", ");
-        return bad(format!("Cannot found column '{missing}' in columns [{fieldnames}]"));
-    }
+    let position_columns = match PositionColumns::named(param("lat").map(String::as_str), param("lon").map(String::as_str)) {
+        Ok(position_columns) => position_columns,
+        Err(title) => return bad(title),
+    };
+    let named_columns = position_columns.iter().flat_map(|position| [&position.lat, &position.lon]);
+    check_columns(&fieldnames, columns.iter().chain(filter_columns.columns()).chain(named_columns))?;
     // Not addok-csv's, which ignores `result_columns`: the house number
     // split, for a client that names its columns there.
     let named = request.params.get("result_columns");
@@ -177,15 +152,19 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         out.push('\u{feff}');
     }
     pycsv::write_row(&mut out, headers.iter().map(String::as_str), &dialect);
-    // DictReader skips empty records.
     let mut too_long = Vec::new();
-    for (i, row) in records.filter(|row| !row.is_empty()).enumerate() {
-        let value = |column: &str| pycsv::value(&fieldnames, &row, column).unwrap_or("");
+    for (i, row) in records.iter().enumerate() {
+        let value = |column: &str| pycsv::value(&fieldnames, row, column).unwrap_or("");
         let query = columns.iter().map(|column| value(column)).collect::<Vec<_>>().join(" ");
         // addok-csv fails the whole request on a query over addok's limit
         // (HTTP 413); the row is answered empty instead, and reported.
         let filters = filter_columns.filters(value);
-        let geocoded = geocode(index, &query, &filters, min_score, postcode_fallback).unwrap_or_else(|_| {
+        let center = match position_columns.as_ref().map(|position| position.center(value)) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(center)) => center,
+            Some(Err(title)) => return bad(format!("{title}, row {}", i + 1)),
+        };
+        let geocoded = geocode(index, &query, &filters, center, min_score, postcode_fallback).unwrap_or_else(|_| {
             too_long.push(i + 1);
             None
         });
@@ -203,24 +182,199 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         pycsv::write_row(&mut out, cells, &dialect);
     }
 
+    let warnings = match too_long.is_empty() {
+        true => Vec::new(),
+        false => vec![Warning::QueryTooLong { rows: too_long }],
+    };
+    Ok(response(request, encoding, with_signature, out, warnings))
+}
+
+/// addok-csv's `CSV_REVERSE_HEADERS`, then its `CSV_EXTRA_FIELDS`, but
+/// `result_street`, as on `/search/csv`.
+const REVERSE_HEADERS: [&str; 15] = [
+    "result_latitude",
+    "result_longitude",
+    "result_label",
+    "result_distance",
+    "result_type",
+    "result_id",
+    "result_housenumber",
+    "result_name",
+    "result_postcode",
+    "result_city",
+    "result_context",
+    "result_citycode",
+    "result_oldcitycode",
+    "result_oldcity",
+    "result_district",
+];
+
+/// What addok-csv's `/reverse/csv` answers to the request: the same file
+/// out with the address nearest each row's position, read from its
+/// `latitude` or `lat` column, and its `longitude`, `lon`, `lng` or
+/// `long`; none for a row whose values are not numbers, as addok-csv
+/// leaves it. A latitude python-geohash refuses is refused, naming its
+/// row, where addok-csv fails the whole request.
+pub fn reverse_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result<Response, Error> {
+    let param = |name: &str| request.params.get(name).and_then(|values| values.last());
+    let (encoding, with_signature, content) = decode(request)?;
+    let dialect = dialect(&content, param("delimiter"), param("quote"))?;
+    let with_bom = with_bom(request)?;
+    // Not addok-csv's: the nearest addresses within a radius, asked for.
+    let nearest = nearest_radius(|name| param(name).map(String::as_str)).map_err(Error::BadRequest)?;
+    let (dialect, fieldnames, records, columns) = table(request, &content, dialect);
+    let filter_columns = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
+    check_columns(&fieldnames, columns.iter().chain(filter_columns.columns()))?;
+    let mut headers = fieldnames.clone();
+    let new = REVERSE_HEADERS.iter().filter(|&&header| !fieldnames.iter().any(|name| name == header));
+    headers.extend(new.map(|&header| header.to_owned()));
+
+    let mut out = String::new();
+    if encoding.starts_with("utf-8") && with_bom {
+        out.push('\u{feff}');
+    }
+    pycsv::write_row(&mut out, headers.iter().map(String::as_str), &dialect);
+    for (i, row) in records.iter().enumerate() {
+        let value = |column: &str| pycsv::value(&fieldnames, row, column).unwrap_or("");
+        // addok-csv's `row.get("latitude", row.get("lat"))`: the first
+        // column the file has decides, its value a number or the row left
+        // without a result.
+        let coordinate = |names: &[&str]| {
+            let name = names.iter().find(|&&name| fieldnames.iter().any(|field| field == name))?;
+            read_float(pycsv::value(&fieldnames, row, name)?)
+        };
+        let center = coordinate(&["latitude", "lat"])
+            .zip(coordinate(&["longitude", "lon", "lng", "long"]))
+            .map(|(lat, lon)| Center { lat, lon });
+        if let Some(center) = center.filter(|center| !(-90.0..90.0).contains(&center.lat)) {
+            let title = format!("latitude {} out of range, row {}", python_float(center.lat), i + 1);
+            return Err(Error::BadRequest(title));
+        }
+        let found = center.and_then(|center| {
+            let filters = filter_columns.filters(value);
+            let found = match nearest {
+                None => reverse(index, center, 1, &filters),
+                Some(radius) => reverse_nearest(index, center, 1, &filters, radius),
+            };
+            found.into_iter().next()
+        });
+        let result = found.as_ref().map(reverse_cells);
+        let cells = headers.iter().map(|header| {
+            let computed = REVERSE_HEADERS.iter().position(|known| known == header);
+            match (&result, computed) {
+                (Some(result), Some(i)) => result[i].as_str(),
+                _ => value(header),
+            }
+        });
+        pycsv::write_row(&mut out, cells, &dialect);
+    }
+    Ok(response(request, encoding, with_signature, out, Vec::new()))
+}
+
+/// The values a row takes for `REVERSE_HEADERS`, as addok-csv writes them.
+fn reverse_cells(found: &Found) -> [String; 15] {
+    let document = &found.document;
+    let (lat, lon) = match &found.housenumber {
+        Some(number) => (Some(number.lat), Some(number.lon)),
+        None => (document.lat, document.lon),
+    };
+    let number = |number: Option<Number>| number.as_ref().map_or(String::new(), python_number);
+    let text = |text: &Text| text.first().unwrap_or_default().to_owned();
+    [
+        number(lat),
+        number(lon),
+        found.label().to_owned(),
+        (found.distance.unwrap_or_default() as i64).to_string(),
+        found.kind().to_owned(),
+        found.id().to_owned(),
+        found.housenumber.as_ref().map_or(String::new(), |number| number.number.clone()),
+        text(&document.name),
+        text(&document.postcode),
+        text(&document.city),
+        text(&document.context),
+        text(&document.citycode),
+        text(&document.oldcitycode),
+        text(&document.oldcity),
+        text(&document.district),
+    ]
+}
+
+/// The request's file decoded as addok-csv decodes it: its encoding,
+/// whether that one writes a signature, and the text, its line breaks
+/// RFC 4180's.
+fn decode(request: &Request) -> Result<(&str, bool, String), Error> {
+    let bad = |title: String| Err(Error::BadRequest(title));
+    let encoding = request.params.get("encoding").and_then(|values| values.last()).map_or("utf-8-sig", String::as_str);
+    let with_signature = match encoding.to_lowercase().replace('-', "_").as_str() {
+        "utf_8" | "utf8" | "u8" | "utf" => false,
+        "utf_8_sig" | "utf8_sig" => true,
+        _ => return bad(format!("Unable to decode with encoding \"{encoding}\"")),
+    };
+    let Ok(text) = std::str::from_utf8(&request.data) else {
+        return bad(format!("Unable to decode with encoding \"{encoding}\""));
+    };
+    let text = match with_signature {
+        true => text.strip_prefix('\u{feff}').unwrap_or(text),
+        false => text,
+    };
+    let content = text.replace('\r', "").replace('\n', "\r\n");
+    if content.is_empty() {
+        return bad("Empty file".into());
+    }
+    Ok((encoding, with_signature, content))
+}
+
+/// `with_bom`, as falcon reads it for addok-csv.
+fn with_bom(request: &Request) -> Result<bool, Error> {
+    match request.params.get("with_bom").and_then(|values| values.last()).map(|value| param_flag(value).ok_or(value)) {
+        None => Ok(false),
+        Some(Ok(on)) => Ok(on),
+        Some(Err(value)) => Err(Error::BadRequest(format!("Invalid parameter \"with_bom\": {value}"))),
+    }
+}
+
+/// The file's records, as `read` reads them: the dialect, the header, the
+/// rows but the empty ones, which DictReader skips, and the columns asked
+/// for, all of them if none.
+fn table(request: &Request, content: &str, dialect: Dialect) -> (Dialect, Vec<String>, Vec<Vec<String>>, Vec<String>) {
+    let requested = request.params.get("columns").filter(|columns| !columns.is_empty());
+    let quote = request.params.get("quote").and_then(|values| values.last()).and_then(|quote| quote.chars().next());
+    let (dialect, records) = read(content, dialect, requested, quote);
+    let mut records = records.into_iter();
+    let fieldnames = records.next().unwrap_or_default();
+    let columns = match requested {
+        Some(columns) => columns.clone(),
+        None => fieldnames.clone(),
+    };
+    (dialect, fieldnames, records.filter(|row| !row.is_empty()).collect(), columns)
+}
+
+/// addok-csv's refusal of a column the file lacks.
+fn check_columns<'c>(fieldnames: &[String], mut columns: impl Iterator<Item = &'c String>) -> Result<(), Error> {
+    match columns.find(|column| !fieldnames.contains(column)) {
+        None => Ok(()),
+        Some(missing) => {
+            let fieldnames: Vec<String> = fieldnames.iter().map(|name| python_str(name)).collect();
+            let fieldnames = fieldnames.join(", ");
+            Err(Error::BadRequest(format!("Cannot found column '{missing}' in columns [{fieldnames}]")))
+        }
+    }
+}
+
+/// The answer: the written file, signed as its encoding signs, attached
+/// under the name addok-csv gives it.
+fn response(request: &Request, encoding: &str, with_signature: bool, out: String, warnings: Vec<Warning>) -> Response {
     let mut body = Vec::with_capacity(out.len() + 3);
     if with_signature {
         body.extend_from_slice("\u{feff}".as_bytes());
     }
     body.extend_from_slice(out.as_bytes());
-    let warnings = match too_long.is_empty() {
-        true => Vec::new(),
-        false => vec![Warning::QueryTooLong { rows: too_long }],
-    };
-    Ok(Response {
+    Response {
         body,
         content_type: format!("text/csv; charset={encoding}"),
-        content_disposition: format!(
-            "attachment; filename=\"{}.geocoded.csv\"",
-            stem(&request.filename)
-        ),
+        content_disposition: format!("attachment; filename=\"{}.geocoded.csv\"", stem(&request.filename)),
         warnings,
-    })
+    }
 }
 
 /// addok-csv's `compute_dialect`: Python's sniffed dialect, or the Unix
@@ -556,8 +710,19 @@ mod tests {
         // A column the file lacks is refused, as a missing query column is.
         let refused = search_csv(&index, &request(&[("postcode", "zip")]));
         assert!(matches!(refused, Err(Error::BadRequest(title)) if title.starts_with("Cannot found column 'zip'")));
-        // Positions are not ported yet.
-        let refused = search_csv(&index, &request(&[("lat", "lat")]));
-        assert!(matches!(refused, Err(Error::BadRequest(title)) if title == "Unsupported parameter \"lat\""));
+        // A position's columns go together, and must exist; addok-csv
+        // ignores either fault.
+        let refused = search_csv(&index, &request(&[("lat", "cp")]));
+        assert!(matches!(refused, Err(Error::BadRequest(title)) if title == "\"lat\" names a column without \"lon\""));
+        let refused = search_csv(&index, &request(&[("lat", "la"), ("lon", "cp")]));
+        assert!(matches!(refused, Err(Error::BadRequest(title)) if title.starts_with("Cannot found column 'la'")));
+        // A value that is not a number, or not a latitude, is refused,
+        // naming its row, where addok-csv fails the whole request.
+        let refused = search_csv(&index, &request(&[("lat", "q"), ("lon", "cp")]));
+        let title = "invalid number \"RUE CLEMENT MAROT\" in column \"q\", row 1";
+        assert!(matches!(&refused, Err(Error::BadRequest(refused)) if refused == title), "{refused:?}");
+        let refused = search_csv(&index, &request(&[("lat", "cp"), ("lon", "cp")]));
+        let title = "latitude \"69001\" out of range in column \"cp\", row 1";
+        assert!(matches!(&refused, Err(Error::BadRequest(refused)) if refused == title), "{refused:?}");
     }
 }

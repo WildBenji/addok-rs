@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.12.0 — 2026-10-09
+
+addok's reverse geocoding, at parity with addok 1.3.2, on every interface. With it every addok feature used for geocoding is ported: search, autocomplete, filters, search around a point and reverse. The index is unchanged: no rebuild.
+
+### Features
+
+- **Reverse geocoding:** the address nearest a position, as addok finds it.
+  - **`GET /reverse`** is addok's endpoint, in the GeoJSON of `/search`: `lat`, `lon` (with `latitude`, `lng`, `long`, `longitude`), `limit`, the filters `type`, `citycode` and `postcode`. Each result has its `distance` in metres; a street answers as whichever of its house numbers is closest to the position, or as its own point if that is closer.
+  - **`POST /reverse/csv`** is addok-csv's: each row's position is read from its `latitude` or `lat` and `longitude`, `lon`, `lng` or `long` columns, and the 15 result columns follow. A row whose position is not made of numbers stays without a result. Filters name columns here as elsewhere; addok-csv 1.1.0 fails on them. A latitude outside [-90, 90) is refused with a 400 naming its row, where addok-csv fails the whole request.
+  - **`POST /reverse/batch` and `addok-cli reverse`** bring it to whole files, Parquet or CSV in and out, as `/batch` does for search: the position in addok-csv's columns or in the ones named (`lat`, `lon`; `--lat`, `--lon`), the results typed, `--filters`, `--cores`.
+  - **Measured:** on 43,094 `/reverse` requests and 20 files of 1,000 rows over positions of the BAN, offset by 0 to 2 km, and random ones, every answer is identical to addok's but for addresses at exactly the same distance, which addok's sets order as they please.
+- **The nearest address, asked for:** `nearest=1` (`--nearest on`) on `/reverse`, `/reverse/csv`, `/reverse/batch` and `addok-cli reverse`. addok looks no further than about 150 m around the position: past that it answers nothing, and an address just outside its cells loses to a farther one inside. `nearest` finds the nearest address within a `radius` in metres (5,000 by default, 10,000 at most). Where addok's cells hold the nearest address it gives addok's answer; elsewhere the nearest. At 1 km from an address addok answers 78% of positions and not with the nearest in 4% of them; `nearest` answers all, and was checked against a scan of all 28.5 million positions of the BAN. Near an address it answers as fast as addok's search; where none lies within the radius it explores it whole, 0.5 ms a position for 5 km.
+- **`addok_core::reverse`:** `reverse` and `reverse_nearest`; `addok_core::geohash::ring`.
+
+### Changed
+
+- **The index size in the guides** is corrected to 1.94 GB, as of v0.11.0.
+
+## v0.11.0 — 2026-10-09
+
+addok's search around a point, at parity with addok 1.3.2, on every interface. **The index must be rebuilt** (`addok-cli build`): it gains the geohash sections search around a point reads.
+
+### Features
+
+- **Search around a point** (`lat`, `lon`), as addok does: addresses near the point rank higher, with a distance score up to 0.1 within 100 km, and the addresses right around it (about 150 m) are searched too, so that a house number alone (`12`) finds the nearest ones.
+  - **`/search`** reads `lat` and `lon` as addok does, `latitude`, `lng`, `long` and `longitude` included, and answers each result's `distance` in metres and the `center`.
+  - **`/search/csv`, `/batch` and `addok-cli batch`** (`--lat COL --lon COL`): two columns give each row its own position, as in addok-csv; a row with an empty cell is searched without one. One column without the other, a column the file lacks, or a value that is not a number or not a latitude is refused with a 400 naming the row, where addok-csv ignores the first two and fails the whole request on the third.
+  - **Scores change scale with a position:** the distance's ceiling joins the sum the score is divided by. A confidence threshold set without a position does not hold with one.
+  - **Search:** `addok_core::search::search_with` and `Options` (limit, autocomplete, filters, `Center`); `addok_core::geohash`, python-geohash's cells.
+  - **Measured:** every geohash cell of addok's index holds as many documents in addok-rs's. On 90,128 requests over real addresses, half around a position near or far, every result both answers hold at the same rank is identical, distance included; the 2,131 requests where search itself diverges are all explained by the orders addok leaves to chance.
+- **The index file** grows from 1.86 to 1.94 GB, built in about 90 s as before.
+
+### Changed
+
+- **An index built by an earlier addok-rs is refused,** with the message that says to rebuild it.
+- **`addok_core::search::search_traced`** takes `Options`.
+- **`/search`, `/search/csv` and `/batch` no longer refuse `lat` and `lon`.**
+
 ## v0.10.0 — 2026-10-09
 
 addok's autocomplete, at parity with addok 1.3.2: `/search` now answers as addok's does by default.

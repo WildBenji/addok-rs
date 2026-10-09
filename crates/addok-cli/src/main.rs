@@ -4,6 +4,7 @@
 //! addok-cli build adresses-addok-france.ndjson.gz ban.addok
 //! addok-cli serve ban.addok --host 0.0.0.0 --port 7878
 //! addok-cli batch ban.addok addresses.parquet geocoded.parquet --columns ad3,city,zip_code
+//! addok-cli reverse ban.addok positions.parquet addresses.parquet --nearest on
 //! addok-cli --version
 //! ```
 
@@ -13,8 +14,8 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use addok_cli::batch::{self, Format, Options};
-use addok_cli::geocoded::{FilterColumns, MIN_SCORE};
+use addok_cli::batch::{self, Format, Options, ReverseOptions};
+use addok_cli::geocoded::{FilterColumns, MIN_SCORE, PositionColumns, nearest_radius};
 use addok_cli::search_csv::flag;
 use addok_core::document::Document;
 use addok_core::index::{Index, OpenError, write};
@@ -25,7 +26,8 @@ const USAGE: &str = "\
 usage:
   addok-cli build <ndjson[.gz]> <index>    index the BAN's NDJSON into a file
   addok-cli serve <index> [--host HOST] [--port PORT] [--cores N]
-                                           serve /search, /search/csv and /batch (default 127.0.0.1:7878)
+                                           serve /search, /reverse, their /csv, /batch and
+                                           /reverse/batch (default 127.0.0.1:7878)
   addok-cli batch <index> <input> <output> [options]
                                            geocode a Parquet or CSV file into another
     --columns A,B,C           the columns a row's query joins (default: all)
@@ -39,7 +41,19 @@ usage:
                               result_num_complement_short (default: none)
     --filters F=COL,F=COL     keep the results each row's value in COL allows, for each
                               filter F: type, citycode or postcode (default: none)
+    --lat COL --lon COL       search each row around its position in these columns
+                              (default: none)
     --cores N                 (see below)
+  addok-cli reverse <index> <input> <output> [options]
+                                           the address nearest each row's position, a Parquet or
+                                           CSV file into another
+    --lat COL --lon COL       the position's columns (default: latitude or lat, then
+                              longitude, lon, lng or long)
+    --nearest on              the nearest address within the radius, where addok looks no
+                              further than about 150 m around (default: off)
+    --radius M                the nearest's radius in metres, up to 10000 (default: 5000)
+    --filters, --input-format, --output-format, --input-delimiter, --output-delimiter,
+    --cores N                 as for batch
   addok-cli --version                      print addok-cli's version, as /health gives it
 
   --cores N: how many cores to use, from 1 to the machine's (default: all of them)";
@@ -51,6 +65,7 @@ fn main() -> ExitCode {
         ["build", ndjson, index] => build(ndjson, index),
         ["serve", index, ref options @ ..] => serve(index, options),
         ["batch", index, input, output, ref options @ ..] => batch_file(index, input, output, options),
+        ["reverse", index, input, output, ref options @ ..] => reverse_file(index, input, output, options),
         ["--version"] => {
             println!("addok-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -141,14 +156,8 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
     let mut min_score = MIN_SCORE;
     let mut postcode_fallback = false;
     let mut filters = FilterColumns::default();
+    let (mut lat, mut lon) = (None, None);
     let mut cores = available_cores();
-    let one = |value: &str| {
-        let mut chars = value.chars();
-        match (chars.next(), chars.next()) {
-            (Some(c), None) => Ok(c),
-            _ => Err(format!("a delimiter is one character, not {value:?}")),
-        }
-    };
     for option in options.chunks(2) {
         match *option {
             ["--columns", value] => columns = value.split(',').map(str::to_owned).collect(),
@@ -160,15 +169,12 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
             ["--min-score", value] => min_score = value.parse().map_err(|_| USAGE.to_owned())?,
             ["--postcode-fallback", value] => postcode_fallback = flag(value).ok_or(USAGE.to_owned())?,
             ["--filters", value] => filters = filter_columns(value)?,
+            ["--lat", value] => lat = Some(value),
+            ["--lon", value] => lon = Some(value),
             ["--cores", value] => cores = parse_cores(value)?,
             _ => return Err(USAGE.to_owned()),
         }
     }
-    let format = |name: Option<&str>, path: &str, delimiter| match name {
-        Some(name) => Format::named(name, delimiter).ok_or(format!("unknown format {name:?}")),
-        None => Format::of_file(path, delimiter)
-            .ok_or(format!("{path}: name its format with --input-format or --output-format")),
-    };
     let input_format = format(input_format, input, input_delimiter)?;
     let output_format = format(output_format, output, output_delimiter)?;
     let index = open(index)?;
@@ -182,6 +188,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
         postcode_fallback,
         result_columns,
         filters,
+        position: PositionColumns::named(lat, lon).map_err(|_| "--lat and --lon go together".to_owned())?,
     };
     let (geocoded, warnings) = batch::geocode_table(&index, &table, &options).map_err(|e| format!("{input}: {e}"))?;
     for warning in &warnings {
@@ -196,6 +203,74 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
         table.num_rows() as f64 / elapsed
     );
     Ok(())
+}
+
+/// The address nearest each row's position, a file into another.
+fn reverse_file(index: &str, input: &str, output: &str, options: &[&str]) -> Result<(), String> {
+    let (mut input_format, mut output_format) = (None, None);
+    let (mut input_delimiter, mut output_delimiter) = (batch::DELIMITER, batch::DELIMITER);
+    let mut filters = FilterColumns::default();
+    let (mut lat, mut lon, mut nearest, mut radius) = (None, None, None, None);
+    let mut cores = available_cores();
+    for option in options.chunks(2) {
+        match *option {
+            ["--input-format", value] => input_format = Some(value),
+            ["--output-format", value] => output_format = Some(value),
+            ["--input-delimiter", value] => input_delimiter = one(value)?,
+            ["--output-delimiter", value] => output_delimiter = one(value)?,
+            ["--filters", value] => filters = filter_columns(value)?,
+            ["--lat", value] => lat = Some(value),
+            ["--lon", value] => lon = Some(value),
+            ["--nearest", value] => nearest = Some(value),
+            ["--radius", value] => radius = Some(value),
+            ["--cores", value] => cores = parse_cores(value)?,
+            _ => return Err(USAGE.to_owned()),
+        }
+    }
+    let nearest = nearest_radius(|name| match name {
+        "nearest" => nearest,
+        _ => radius,
+    })
+    .map_err(|e| e.replace("\"nearest\"", "--nearest").replace("\"radius\"", "--radius"))?;
+    let input_format = format(input_format, input, input_delimiter)?;
+    let output_format = format(output_format, output, output_delimiter)?;
+    let index = open(index)?;
+    let start = Instant::now();
+    let bytes = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
+    let table = batch::read(bytes, input_format).map_err(|e| format!("{input}: {e}"))?;
+    let options = ReverseOptions {
+        position: PositionColumns::named(lat, lon).map_err(|_| "--lat and --lon go together".to_owned())?,
+        threads: cores,
+        filters,
+        nearest,
+    };
+    let found = batch::reverse_table(&index, &table, &options).map_err(|e| format!("{input}: {e}"))?;
+    let bytes = batch::write(&found, output_format).map_err(|e| format!("{output}: {e}"))?;
+    std::fs::write(output, bytes).map_err(|e| format!("{output}: {e}"))?;
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "{output}: {} rows in {elapsed:.1} s, {:.0} rows/s",
+        table.num_rows(),
+        table.num_rows() as f64 / elapsed
+    );
+    Ok(())
+}
+
+/// A file's format: the one named, or its extension's.
+fn format(name: Option<&str>, path: &str, delimiter: char) -> Result<Format, String> {
+    match name {
+        Some(name) => Format::named(name, delimiter).ok_or(format!("unknown format {name:?}")),
+        None => Format::of_file(path, delimiter).ok_or(format!("{path}: name its format with --input-format or --output-format")),
+    }
+}
+
+/// A CSV delimiter: one character.
+fn one(value: &str) -> Result<char, String> {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(format!("a delimiter is one character, not {value:?}")),
+    }
 }
 
 /// `--filters type=COL,postcode=COL`: the columns of each filter, a filter

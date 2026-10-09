@@ -11,6 +11,7 @@ use super::encoding::{self, SCALES};
 use super::format::{Kind, Writer, hash_table};
 use super::{TokenId, doc_filters, document_tokens, edge_ngrams, housenumber_token, importance};
 use crate::document::{Document, HouseNumber, Number, Text};
+use crate::geohash::{self, Cell};
 use crate::postings::DocId;
 
 #[derive(Default)]
@@ -23,26 +24,35 @@ pub(super) struct Builder {
     vocabulary: Vocabulary,
     /// The documents each filter holds, by input position.
     filters: HashMap<String, Vec<DocId>>,
+    /// The cells documents lie in, by input position, each pair once.
+    geohashes: Vec<(Cell, DocId)>,
 }
 
 impl Builder {
     pub(super) fn add(&mut self, mut doc: Document) {
         let input = DocId::try_from(self.documents.ids.len()).expect("fewer than 2^32 documents");
         let housenumbers = doc.housenumbers.take().unwrap_or_default();
-        let housenumbers = self.add_housenumbers(&doc.id, housenumbers);
+        // addok's `HousenumbersIndexer` runs first, on the house numbers
+        // kept, and is not undone when the next one refuses a document
+        // unnamed.
+        let (housenumbers, mut cells) = self.add_housenumbers(&doc.id, housenumbers);
         if let Some(tokens) = document_tokens(&doc) {
             self.vocabulary.add(input, tokens);
             for filter in doc_filters(&doc, housenumbers.1 > 0) {
                 self.filters.entry(filter).or_default().push(input);
             }
+            cells.extend(doc.lat.zip(doc.lon).and_then(|(lat, lon)| cell(lat, lon)));
         }
+        cells.sort_unstable();
+        cells.dedup();
+        self.geohashes.extend(cells.into_iter().map(|cell| (cell, input)));
         self.add_document(input, doc, housenumbers);
     }
 
     /// A street's house numbers, sorted by token and, as in addok's dict,
     /// one per token: the street's last. Returns where they start in the
-    /// columns, and how many there are.
-    fn add_housenumbers(&mut self, street: &str, housenumbers: Vec<HouseNumber>) -> (u32, u32) {
+    /// columns and how many there are, and the cells they lie in.
+    fn add_housenumbers(&mut self, street: &str, housenumbers: Vec<HouseNumber>) -> ((u32, u32), Vec<Cell>) {
         let start = self.housenumbers.numbers.len();
         let mut numbered: Vec<(u32, HouseNumber)> = housenumbers
             .into_iter()
@@ -52,15 +62,14 @@ impl Builder {
         numbered.reverse(); // So that sorting keeps the last of a token first.
         numbered.sort_by(|a, b| tokens[a.0 as usize].cmp(&tokens[b.0 as usize]));
         numbered.dedup_by(|later, kept| tokens[later.0 as usize] == tokens[kept.0 as usize]);
+        let cells = numbered.iter().filter_map(|(_, number)| cell(number.lat, number.lon)).collect();
         for (number, housenumber) in numbered {
             self.housenumbers
                 .push(&mut self.strings, street, number, housenumber);
         }
         let count = self.housenumbers.numbers.len() - start;
-        (
-            u32::try_from(start).expect("fewer than 2^32 house numbers"),
-            count as u32,
-        )
+        let range = (u32::try_from(start).expect("fewer than 2^32 house numbers"), count as u32);
+        (range, cells)
     }
 
     fn add_document(&mut self, input: DocId, doc: Document, housenumbers: (u32, u32)) {
@@ -127,6 +136,7 @@ impl Builder {
             numbers,
             vocabulary,
             filters,
+            geohashes,
         } = self;
         let count = documents.ids.len();
         let mut order: Vec<DocId> = (0..count as DocId).collect();
@@ -144,6 +154,7 @@ impl Builder {
         let mut writer = Writer::new(out);
         write_tokens(&mut writer, vocabulary, &numbered)?;
         write_filters(&mut writer, filters, &numbered)?;
+        write_geohashes(&mut writer, geohashes, &numbered)?;
         writer.section(Kind::Strings, &strings.blob)?;
         writer.section(Kind::StringOffsets, &strings.ends)?;
         drop(strings);
@@ -264,6 +275,33 @@ fn write_filters<W: Write>(
         writer.extend(documents)?;
     }
     writer.end()
+}
+
+/// The cell of a position, as addok's `index_geohash` files it.
+fn cell(lat: Number, lon: Number) -> Option<Cell> {
+    geohash::encode(lat.value(), lon.value())
+}
+
+/// The cells, ascending, each its documents: addok's `g|<geohash>` sets.
+fn write_geohashes<W: Write>(
+    writer: &mut Writer<W>,
+    mut geohashes: Vec<(Cell, DocId)>,
+    numbered: &[DocId],
+) -> io::Result<()> {
+    for (_, doc) in &mut geohashes {
+        *doc = numbered[*doc as usize];
+    }
+    geohashes.sort_unstable();
+    let mut cells: Vec<Cell> = geohashes.iter().map(|&(cell, _)| cell).collect();
+    cells.dedup();
+    let mut ends = vec![0u32];
+    for window in geohashes.chunk_by(|a, b| a.0 == b.0) {
+        ends.push(ends.last().unwrap() + u32::try_from(window.len()).expect("fewer than 2^32 cell entries"));
+    }
+    writer.section(Kind::GeohashCells, &cells)?;
+    writer.section(Kind::GeohashOffsets, &ends)?;
+    let documents: Vec<DocId> = geohashes.into_iter().map(|(_, doc)| doc).collect();
+    writer.section(Kind::Geohashes, &documents)
 }
 
 /// The house numbers, street after street in the documents' order. Returns,

@@ -34,7 +34,9 @@ pub(super) fn texts_mut(doc: &mut Document) -> [&mut Text; 8] {
 pub(super) const NAME: usize = 0;
 pub(super) const POSTCODE: usize = 1;
 pub(super) const CITY: usize = 3;
-/// `importance`'s place in `numbers_mut`.
+/// `lon`'s, `lat`'s and `importance`'s places in `numbers_mut`.
+pub(super) const LON: usize = 2;
+pub(super) const LAT: usize = 3;
 pub(super) const IMPORTANCE: usize = 4;
 
 /// A document's numbers, in their order in `DocNumbers`.

@@ -9,10 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use addok_core::document::Number;
+use addok_core::document::{Document, Number, Text};
 use addok_core::index::Index;
+use addok_core::reverse::{reverse, reverse_nearest};
+use addok_core::search::{Center, Found};
 use arrow::array::{
-    Array, ArrayRef, Float64Builder, RecordBatch, RecordBatchReader, StringArray, StringBuilder,
+    Array, ArrayRef, Float64Array, Float64Builder, Int64Array, RecordBatch, RecordBatchReader, StringArray,
+    StringBuilder,
 };
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -22,7 +25,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
-use crate::geocoded::{FilterColumns, Geocoded, SPLIT_COLUMNS, Warning, geocode, split_housenumber};
+use crate::geocoded::{
+    FilterColumns, Geocoded, PositionColumns, SPLIT_COLUMNS, Warning, geocode, python_float, split_housenumber,
+};
 use crate::pycsv::{self, Dialect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +90,23 @@ pub struct Options {
     pub result_columns: Vec<String>,
     /// The columns whose values filter each row's search.
     pub filters: FilterColumns,
+    /// The columns of each row's position to search around.
+    pub position: Option<PositionColumns>,
+}
+
+/// What `reverse_table` is asked for.
+#[derive(Debug, Clone)]
+pub struct ReverseOptions {
+    /// The columns of each row's position: the first of addok-csv's names
+    /// the table has if none (`latitude` or `lat`, then `longitude`, `lon`,
+    /// `lng` or `long`).
+    pub position: Option<PositionColumns>,
+    /// Threads to look on, each taking 1,000 consecutive rows at a time.
+    pub threads: usize,
+    /// The columns whose values filter each row's results.
+    pub filters: FilterColumns,
+    /// Not addok's: the radius to search the nearest addresses within.
+    pub nearest: Option<f64>,
 }
 
 /// Why a table cannot be geocoded.
@@ -189,43 +211,24 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
         values.collect::<Vec<_>>().join(" ")
     };
     let filters = |row: usize| options.filters.filters(|name| cell(&filter_columns[name], row));
-
-    let blocks: Vec<std::ops::Range<usize>> = (0..table.num_rows())
-        .step_by(1_000)
-        .map(|start| start..(start + 1_000).min(table.num_rows()))
-        .collect();
-    let next = AtomicUsize::new(0);
-    let mut too_long = Vec::new();
-    let mut geocoded: Vec<(usize, Vec<Option<Geocoded>>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..options.threads.max(1))
-            .map(|_| {
-                scope.spawn(|| {
-                    let (mut done, mut long) = (Vec::new(), Vec::new());
-                    while let Some(rows) = blocks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let block = rows.clone().map(|row| {
-                            geocode(index, &query(row), &filters(row), options.min_score, options.postcode_fallback)
-                                .unwrap_or_else(|_| {
-                                    long.push(row + 1);
-                                    None
-                                })
-                        });
-                        done.push((rows.start, block.collect()));
-                    }
-                    (done, long)
-                })
-            })
-            .collect();
-        let mut geocoded = Vec::new();
-        for worker in workers {
-            let (done, long) = worker.join().unwrap();
-            geocoded.extend(done);
-            too_long.extend(long);
+    // Read before geocoding: a value that is not a number fails the table.
+    let centers = match &options.position {
+        None => vec![None; table.num_rows()],
+        Some(position) => {
+            let (lat, lon) = (text(&position.lat)?, text(&position.lon)?);
+            let center = |row: usize| {
+                let value = |name: &str| if name == position.lat { cell(&lat, row) } else { cell(&lon, row) };
+                position.center(value).map_err(|title| Error(format!("{title}, row {}", row + 1)))
+            };
+            (0..table.num_rows()).map(center).collect::<Result<Vec<_>, _>>()?
         }
-        geocoded
+    };
+
+    let geocoded = in_blocks(table.num_rows(), options.threads, |row| {
+        geocode(index, &query(row), &filters(row), centers[row], options.min_score, options.postcode_fallback)
     });
-    geocoded.sort_unstable_by_key(|&(start, _)| start);
-    let rows: Vec<Option<Geocoded>> = geocoded.into_iter().flat_map(|(_, block)| block).collect();
-    too_long.sort_unstable();
+    let too_long: Vec<usize> = (1..).zip(&geocoded).filter(|(_, geocoded)| geocoded.is_err()).map(|(row, _)| row).collect();
+    let rows: Vec<Option<Geocoded>> = geocoded.into_iter().map(|geocoded| geocoded.ok().flatten()).collect();
     let warnings = match too_long.is_empty() {
         true => Vec::new(),
         false => vec![Warning::QueryTooLong { rows: too_long }],
@@ -243,10 +246,151 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
             results.push((name, DataType::Utf8, Arc::new(column)));
         }
     }
+    Ok((with_results(table, results)?, warnings))
+}
+
+/// The reverse result columns, in order, as `/reverse/csv` writes them,
+/// typed.
+const REVERSE_RESULTS: [(&str, DataType); 15] = [
+    ("result_latitude", DataType::Float64),
+    ("result_longitude", DataType::Float64),
+    ("result_label", DataType::Utf8),
+    ("result_distance", DataType::Int64),
+    ("result_type", DataType::Utf8),
+    ("result_id", DataType::Utf8),
+    ("result_housenumber", DataType::Utf8),
+    ("result_name", DataType::Utf8),
+    ("result_postcode", DataType::Utf8),
+    ("result_city", DataType::Utf8),
+    ("result_context", DataType::Utf8),
+    ("result_citycode", DataType::Utf8),
+    ("result_oldcitycode", DataType::Utf8),
+    ("result_oldcity", DataType::Utf8),
+    ("result_district", DataType::Utf8),
+];
+
+/// The table, each row with the address nearest its position, as
+/// `/reverse/csv` finds it: none for a row whose position is missing or not
+/// numbers; a latitude python-geohash refuses fails the table, naming its
+/// row.
+pub fn reverse_table<B: AsRef<[u8]> + Sync>(
+    index: &Index<B>,
+    table: &RecordBatch,
+    options: &ReverseOptions,
+) -> Result<RecordBatch, Error> {
+    let has = |name: &str| table.column_by_name(name).is_some();
+    let (lat, lon) = match &options.position {
+        Some(position) => (position.lat.as_str(), position.lon.as_str()),
+        None => {
+            let lat = ["latitude", "lat"].into_iter().find(|&name| has(name));
+            let lon = ["longitude", "lon", "lng", "long"].into_iter().find(|&name| has(name));
+            lat.zip(lon).ok_or_else(|| Error("no position columns: name them with lat and lon".into()))?
+        }
+    };
+    let (lats, lons) = (coordinates(table, lat)?, coordinates(table, lon)?);
+    let text = |name: &str| -> Result<StringArray, Error> {
+        let column = table.column_by_name(name).ok_or_else(|| Error(format!("no column \"{name}\"")))?;
+        let text = cast(column, &DataType::Utf8).map_err(error)?;
+        Ok(text.as_any().downcast_ref::<StringArray>().unwrap().clone())
+    };
+    let mut filter_columns = HashMap::new();
+    for name in options.filters.columns() {
+        filter_columns.insert(name.as_str(), text(name)?);
+    }
+    let centers: Vec<Option<Center>> = lats.iter().zip(&lons).map(|(lat, lon)| lat.zip(*lon).map(|(lat, lon)| Center { lat, lon })).collect();
+    if let Some(row) = centers.iter().position(|center| center.is_some_and(|center| !(-90.0..90.0).contains(&center.lat))) {
+        return Err(Error(format!("latitude out of range in column \"{lat}\", row {}", row + 1)));
+    }
+    let found = in_blocks(table.num_rows(), options.threads, |row| {
+        let center = centers[row]?;
+        let filters = options.filters.filters(|name| cell(&filter_columns[name], row));
+        let found = match options.nearest {
+            None => reverse(index, center, 1, &filters),
+            Some(radius) => reverse_nearest(index, center, 1, &filters, radius),
+        };
+        found.into_iter().next()
+    });
+    let results = REVERSE_RESULTS.iter().zip(reverse_columns(&found)).map(|((name, kind), array)| (*name, kind.clone(), array));
+    with_results(table, results.collect())
+}
+
+/// A position's column read as numbers: as they are in a numeric column,
+/// as Python's `float()` reads them otherwise; none where empty or not one.
+fn coordinates(table: &RecordBatch, name: &str) -> Result<Vec<Option<f64>>, Error> {
+    let column = table.column_by_name(name).ok_or_else(|| Error(format!("no column \"{name}\"")))?;
+    if column.data_type().is_numeric() {
+        let numbers = cast(column, &DataType::Float64).map_err(error)?;
+        let numbers = numbers.as_any().downcast_ref::<Float64Array>().unwrap();
+        return Ok(numbers.iter().collect());
+    }
+    let text = cast(column, &DataType::Utf8).map_err(error)?;
+    let text = text.as_any().downcast_ref::<StringArray>().unwrap();
+    Ok(text.iter().map(|value| value.and_then(python_float)).collect())
+}
+
+/// The reverse result columns of these rows, in `REVERSE_RESULTS`' order.
+fn reverse_columns(rows: &[Option<Found>]) -> Vec<ArrayRef> {
+    let float = |value: &dyn Fn(&Found) -> Option<f64>| -> ArrayRef {
+        Arc::new(rows.iter().map(|row| row.as_ref().and_then(value)).collect::<Float64Array>())
+    };
+    let text = |value: &dyn Fn(&Found) -> Option<String>| -> ArrayRef {
+        Arc::new(rows.iter().map(|row| row.as_ref().and_then(value)).collect::<StringArray>())
+    };
+    let position = |found: &Found| match &found.housenumber {
+        Some(number) => (Some(number.lat), Some(number.lon)),
+        None => (found.document.lat, found.document.lon),
+    };
+    let field = |field: fn(&Document) -> &Text| move |found: &Found| field(&found.document).first().map(str::to_owned);
+    vec![
+        float(&|found| position(found).0.map(Number::value)),
+        float(&|found| position(found).1.map(Number::value)),
+        text(&|found| Some(found.label().to_owned())),
+        Arc::new(rows.iter().map(|row| row.as_ref().and_then(|found| found.distance).map(|distance| distance as i64)).collect::<Int64Array>()),
+        text(&|found| Some(found.kind().to_owned())),
+        text(&|found| Some(found.id().to_owned())),
+        text(&|found| found.housenumber.as_ref().map(|number| number.number.clone())),
+        text(&field(|document| &document.name)),
+        text(&field(|document| &document.postcode)),
+        text(&field(|document| &document.city)),
+        text(&field(|document| &document.context)),
+        text(&field(|document| &document.citycode)),
+        text(&field(|document| &document.oldcitycode)),
+        text(&field(|document| &document.oldcity)),
+        text(&field(|document| &document.district)),
+    ]
+}
+
+/// `f` of each row, in order, computed on `threads` threads, each taking
+/// 1,000 consecutive rows at a time: rows next to each other share their
+/// index pages and caches.
+fn in_blocks<T: Send>(rows: usize, threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let blocks: Vec<std::ops::Range<usize>> = (0..rows).step_by(1_000).map(|start| start..(start + 1_000).min(rows)).collect();
+    let next = AtomicUsize::new(0);
+    let mut done: Vec<(usize, Vec<T>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads.max(1))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    while let Some(rows) = blocks.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        done.push((rows.start, rows.clone().map(&f).collect()));
+                    }
+                    done
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|worker| worker.join().unwrap()).collect()
+    });
+    done.sort_unstable_by_key(|&(start, _)| start);
+    done.into_iter().flat_map(|(_, block)| block).collect()
+}
+
+/// The table, then the results' columns: a column named as a result gives
+/// way to it.
+fn with_results(table: &RecordBatch, results: Vec<(&str, DataType, ArrayRef)>) -> Result<RecordBatch, Error> {
+    let schema = table.schema();
     let mut fields = Vec::new();
     let mut arrays = Vec::new();
     for (field, array) in schema.fields().iter().zip(table.columns()) {
-        // A column named as a result gives way to it.
         if !results.iter().any(|(name, _, _)| name == field.name()) {
             fields.push(field.as_ref().clone());
             arrays.push(array.clone());
@@ -256,8 +400,7 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
         fields.push(Field::new(name, kind, true));
         arrays.push(array);
     }
-    let table = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(error)?;
-    Ok((table, warnings))
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).map_err(error)
 }
 
 /// The result columns of these rows, in `RESULTS`'s order.
@@ -371,6 +514,7 @@ mod tests {
             postcode_fallback: false,
             result_columns: Vec::new(),
             filters: FilterColumns::default(),
+            position: None,
         }
     }
 
@@ -480,6 +624,53 @@ mod tests {
         assert_eq!(types.value(0), "street");
         assert!(types.is_null(1));
         assert!(types.is_null(2));
+    }
+
+    fn reverse_options() -> ReverseOptions {
+        ReverseOptions { position: None, threads: 2, filters: FilterColumns::default(), nearest: None }
+    }
+
+    #[test]
+    fn finds_the_address_nearest_each_position() {
+        let csv = "id;lat;lon\n1;46.007342;5.421924\n2;;\n3;abc;5.42\n4;46.025;5.4219\n";
+        let table = read(csv.as_bytes().to_vec(), Format::Csv { delimiter: ';' }).unwrap();
+        let found = reverse_table(&index(), &table, &reverse_options()).unwrap();
+        let schema = found.schema();
+        assert_eq!(schema.field_with_name("result_latitude").unwrap().data_type(), &DataType::Float64);
+        assert_eq!(schema.field_with_name("result_distance").unwrap().data_type(), &DataType::Int64);
+        let labels = found.column_by_name("result_label").unwrap().as_any().downcast_ref::<StringArray>().unwrap().clone();
+        // On number 12bis: it. No position, or not numbers: nothing. 2 km
+        // off: nothing, as in addok.
+        assert_eq!(labels.value(0), "12bis Montee de la Foret 01640 L'Abergement-de-Varey");
+        assert!(labels.is_null(1) && labels.is_null(2) && labels.is_null(3));
+        let distances = found.column_by_name("result_distance").unwrap().as_any().downcast_ref::<Int64Array>().unwrap().clone();
+        assert_eq!(distances.value(0), 0);
+        // Asked for, the nearest within the radius.
+        let nearest = ReverseOptions { nearest: Some(5000.0), ..reverse_options() };
+        let found = reverse_table(&index(), &table, &nearest).unwrap();
+        let labels = found.column_by_name("result_label").unwrap().as_any().downcast_ref::<StringArray>().unwrap().clone();
+        assert!(!labels.is_null(3));
+    }
+
+    #[test]
+    fn finds_positions_by_addok_csv_s_names_or_those_given() {
+        let index = index();
+        let read_csv = |csv: &str| read(csv.as_bytes().to_vec(), Format::Csv { delimiter: ';' }).unwrap();
+        let labelled = |table: &RecordBatch, options: &ReverseOptions| {
+            let found = reverse_table(&index, table, options).unwrap();
+            let labels = found.column_by_name("result_label").unwrap().as_any().downcast_ref::<StringArray>().unwrap().clone();
+            !labels.is_null(0)
+        };
+        assert!(labelled(&read_csv("latitude;longitude\n46.007342;5.421924\n"), &reverse_options()));
+        let named = ReverseOptions {
+            position: Some(PositionColumns { lat: "y".into(), lon: "x".into() }),
+            ..reverse_options()
+        };
+        assert!(labelled(&read_csv("y;x\n46.007342;5.421924\n"), &named));
+        let refused = reverse_table(&index, &read_csv("y;x\n46.0;5.4\n"), &reverse_options());
+        assert_eq!(refused, Err(Error("no position columns: name them with lat and lon".into())));
+        let refused = reverse_table(&index, &read_csv("lat;lon\n46.0;5.4\n91;5.4\n"), &reverse_options());
+        assert_eq!(refused, Err(Error("latitude out of range in column \"lat\", row 2".into())));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 addok-rs fait une seule chose : redresser et géocoder des adresses françaises, par lots, à partir de la [Base Adresse Nationale](https://adresse.data.gouv.fr) (BAN). Il ne cherche pas à être un moteur générique comme addok. Il reprend exactement la combinaison qu'utilise la BAN, addok et ses extensions pour la France (addok-fr, addok-france, addok-csv), et la grave dans le code : même normalisation du texte, même phonétique, même classement, mêmes scores.
 
-Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,86 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, numéro découpé).
+Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,94 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, numéro découpé).
 
 ```sh
 docker run -d -p 7878:7878 -v "$PWD/index:/data:ro" ghcr.io/wildbenji/addok-rs
@@ -25,7 +25,7 @@ curl -F data=@adresses.csv -F columns=adresse -F columns=ville -F columns=code_p
 |---|---|---|
 | **Débit de bout en bout**, `/search/csv`, requêtes de 1 000 lignes | 992 adresses/s | **40 700 à 47 800 adresses/s** |
 | **Géocodage d'un fichier Parquet** (100 000 lignes, lecture et écriture comprises) | impossible sans conversion en CSV | **44 745 adresses/s**, sans serveur |
-| **Index** | 5,2 Go dans Redis + 2,3 Go dans SQLite | **1,86 Go**, un seul fichier |
+| **Index** | 5,2 Go dans Redis + 2,3 Go dans SQLite | **1,94 Go**, un seul fichier |
 | **Démarrage**, index prêt à répondre | 21 s à chaud, 102 s à froid | **moins d'une milliseconde** |
 | **Construction de l'index, France entière** | 21 min, plafonnée par Redis | **85 s**, sur un seul cœur |
 | **À faire tourner** | gunicorn, ses workers Python, Redis et SQLite | **un seul binaire** |
@@ -124,6 +124,8 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 
 - **`POST /search/csv` reproduit addok-csv à l'octet près,** moins ses trois défauts. Un client d'addok existant passe à addok-rs en changeant seulement l'URL.
 - **`GET /search` rend le GeoJSON d'addok,** pour une adresse à la fois, autocomplétion comprise.
+- **La recherche autour d'un point** (`lat`, `lon`) sur toutes les interfaces : sur un fichier, chaque ligne est cherchée autour de son propre point, comme dans addok-csv.
+- **Le géocodage inverse d'addok,** `GET /reverse` et `POST /reverse/csv`, et sur un fichier entier, `POST /reverse/batch` et `addok-cli reverse`.
 - **`POST /batch` prend du Parquet ou du CSV et rend du Parquet ou du CSV.** Les colonnes d'origine gardent leur type, et les résultats sont typés : scores et coordonnées en nombres, `null` en l'absence de résultat.
 - **`addok-cli batch` géocode un fichier entier sans serveur,** sur tous les cœurs.
 - **Les filtres d'addok** (`type`, `citycode`, `postcode`) sur toutes les interfaces. Sur un fichier, chaque ligne est filtrée par la valeur de ses propres colonnes, ce qu'addok-csv 1.1.0 ne sait plus faire. Ils donnent les réponses d'addok 1.3.2 sous les mêmes filtres : 99,87 % de réponses identiques sur 540 226 recherches filtrées, chaque écart expliqué.
@@ -139,6 +141,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 Chaque amélioration est désactivée par défaut, afin qu'addok-rs réponde comme addok tant qu'on ne demande rien d'autre. Chacune a été mesurée sur des adresses réelles.
 
 - **Le repli sur la commune quand le code postal est faux,** avec `postcode_fallback=1`. `4 RUE CLEMENT MAROT, PERPIGNAN, 66100` rend le 4 rue Clément Marot à Perpignan (66000), là où addok répond une autre rue sous le seuil. Sur 648 328 adresses réelles, il fait trouver plus de 2 000 adresses justes de plus, pour la même part de réponses justes.
+- **L'adresse la plus proche en géocodage inverse,** avec `nearest=1` : là où addok ne regarde qu'à 150 m alentour, elle cherche dans un rayon de 5 km. À 1 km d'une adresse, addok ne répond rien une fois sur cinq ; `nearest` répond toujours, et rend la même réponse qu'addok partout où la sienne est la plus proche.
 - **Le numéro découpé,** avec `result_columns` : `result_num` (`12`), `result_num_complement` tel que la BAN l'écrit (`bis`), et sa forme courte (`b`) pour rapprocher d'autres données.
 
 ---
@@ -162,7 +165,8 @@ Tout le reste est un **écart**, et chaque écart doit être expliqué. Deux ord
 
 - **Le deuxième résultat** est vérifié de la même façon. addok-csv en publie le score dans `result_score_next`, et là encore, chaque écart est expliqué.
 - **La sortie CSV** de `/search/csv` a été comparée octet par octet aux réponses d'addok-csv sur 100 requêtes de 1 000 lignes. Les seules différences qui ne viennent pas de la recherche sont deux des défauts corrigés.
-- **Le JSON** de `/search` a été comparé à celui d'addok sur 90 108 requêtes : les mêmes adresses, autocomplétion active et non, et en cours de saisie, sous les limites 1, 5, 10, 50 et 100 et sous plusieurs filtres, plus les cas limites des paramètres. Les 628 348 résultats que les deux donnent au même rang sont identiques, propriété par propriété. Sur 2 134 requêtes, la recherche diverge à un rang ou un autre : chaque écart est expliqué par les ordres qu'addok laisse au hasard.
+- **Le JSON** de `/search` a été comparé à celui d'addok sur 90 128 requêtes : les mêmes adresses, autocomplétion active et non, en cours de saisie, autour d'un point proche ou lointain et sans point, sous les limites 1, 5, 10, 50 et 100 et sous plusieurs filtres, plus les cas limites des paramètres. Les 629 984 résultats que les deux donnent au même rang sont identiques, propriété par propriété, distance comprise. Sur 2 131 requêtes, la recherche diverge à un rang ou un autre : chaque écart est expliqué par les ordres qu'addok laisse au hasard.
+- **Le géocodage inverse** a été comparé à celui d'addok sur 43 094 requêtes : des positions tirées de la BAN, sur une adresse, à 30 m, 300 m et 2 km, et au hasard, sous plusieurs limites et filtres, plus les cas limites des paramètres ; et sur 20 fichiers de 1 000 lignes pour `/reverse/csv` : chaque réponse est identique, à l'ordre près des adresses à égale distance.
 - **addok n'est pas toujours d'accord avec lui-même.** D'une graine de hachage ou d'une construction de l'index à l'autre, il change son meilleur résultat sur 80 de ces requêtes, et son deuxième sur 210 : aucune réimplémentation ne peut faire mieux que ce seuil.
 
 ---
@@ -207,7 +211,6 @@ Tout le reste est dans le **[guide d'utilisation](HOW-TO-USE.md)** : paramètres
 addok-rs est un géocodeur **par lots, pour les adresses françaises de la BAN**, et l'assume :
 
 - **Ce n'est pas un géocodeur généraliste.** addok assemble son pipeline à partir de plugins déclarés dans sa configuration ; addok-rs écrit en dur la seule combinaison que la BAN utilise : phonétique et synonymes français, types de voie, compléments `bis` et `ter`, clavier AZERTY pour les fautes de frappe, schéma des documents de la BAN. Une seule combinaison, c'est ce qui permet de vérifier chaque réponse face à addok et de garder le code direct. Indexer une autre source ou un autre pays demanderait de changer le code, pas la configuration.
-- **Ces fonctions d'addok ne sont pas encore portées :** la **recherche autour d'un point** (`lat`, `lon`) et le **géocodage inverse**.
 - **Pas d'authentification,** comme addok : le serveur est fait pour un réseau interne.
 
 ---

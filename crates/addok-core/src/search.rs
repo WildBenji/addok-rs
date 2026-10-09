@@ -2,9 +2,10 @@
 //! (addok/core.py) with the preprocessors, collectors and result processors
 //! the BAN configures, and addok-france's labels. Fuzzy on, autocomplete off
 //! as addok-csv calls it or on as addok's `/search` does by default,
-//! filters but no position. Ported to answer as addok does, quirks
-//! included, but for ties: where addok's order follows Python's hash seed
-//! or Redis's, results rank by score, then by document number.
+//! filters, and a position to search around. Ported to answer as addok
+//! does, quirks included, but for ties: where addok's order follows
+//! Python's hash seed or Redis's, results rank by score, then by document
+//! number.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::document::{Document, HouseNumber, Number, TextRef};
+use crate::geohash;
 use crate::index::{Index, TokenId};
 use crate::postings::{self, DocId, PostingList};
 use crate::text::{self, QueryTooLong};
@@ -32,6 +34,8 @@ const MAX_MEANINGFUL: usize = 10;
 const MANUAL_SCAN: usize = 501;
 /// addok's `MAX_FILTER_VALUES`: the values of one filter it considers.
 const MAX_FILTER_VALUES: usize = 10;
+/// addok's `GEO_DISTANCE_WEIGHT`.
+pub(crate) const GEO_DISTANCE_WEIGHT: f64 = 0.1;
 
 /// addok's `FUZZY_KEY_MAP`: the keys around each letter of an AZERTY keyboard.
 const FUZZY_KEY_MAP: [(char, &str); 26] = [
@@ -79,6 +83,9 @@ pub struct Found {
     /// The best bigram similarity of a label with the query: the second.
     pub str_distance: f64,
     pub score: f64,
+    /// Its distance to the position searched around, in metres: addok's
+    /// `result.distance`; none without one.
+    pub distance: Option<f64>,
 }
 
 impl Found {
@@ -125,7 +132,7 @@ impl Filters {
     /// without filters. Never copied when it can be helped: a lone value's
     /// documents are the index's own list, several values' union the index
     /// keeps once made. `type=street` alone holds over a million.
-    fn documents<'a, B: AsRef<[u8]>>(&self, index: &'a Index<B>) -> Option<FilterDocs<'a>> {
+    pub(crate) fn documents<'a, B: AsRef<[u8]>>(&self, index: &'a Index<B>) -> Option<FilterDocs<'a>> {
         let mut sets: Vec<FilterDocs<'a>> = Vec::new();
         for (name, values) in [("type", &self.kind), ("citycode", &self.citycode), ("postcode", &self.postcode)] {
             let mut distinct: Vec<&str> = Vec::new();
@@ -156,7 +163,7 @@ impl Filters {
     /// addok's `_setup_housenumber_checks`, on the `type` values as given:
     /// whether to match the query's house number, and whether a result must
     /// have one.
-    fn housenumber_checks(&self) -> (bool, bool) {
+    pub(crate) fn housenumber_checks(&self) -> (bool, bool) {
         if self.kind.is_empty() {
             return (true, false);
         }
@@ -167,7 +174,7 @@ impl Filters {
 
 /// The documents the filters hold: the index's own list, or a set made of
 /// several, shared.
-enum FilterDocs<'a> {
+pub(crate) enum FilterDocs<'a> {
     Index(&'a [DocId]),
     Shared(Arc<[DocId]>),
 }
@@ -187,12 +194,40 @@ impl Deref for FilterDocs<'_> {
 /// its `w|…` ones: no token can be it, holding a `|`.
 const FILTER_KEY: &str = "f|";
 
+/// The geohash key among a search's keys, as addok's `gx|…` key sits among
+/// them: the documents of the nine cells around the position.
+const GEOHASH_KEY: &str = "gx|";
+
+/// Whether a key is a word's, not the filters' or the geohash's: addok's
+/// `w|` keys.
+fn is_word(key: &str) -> bool {
+    key != FILTER_KEY && key != GEOHASH_KEY
+}
+
+/// A position to search around: addok's `lat` and `lon`, both given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Center {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+/// What addok's `search` takes beside the query: the results wanted,
+/// autocomplete, the filters and a position.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Options {
+    pub limit: usize,
+    pub autocomplete: bool,
+    pub filters: Filters,
+    pub center: Option<Center>,
+}
+
 /// A document's scores, as a `Found` holds them.
 #[derive(Debug, Clone, Copy)]
 struct Scored {
     importance: f64,
     str_distance: f64,
     score: f64,
+    distance: Option<f64>,
 }
 
 /// addok-csv's `search(q, autocomplete=False, limit=limit)`: the results,
@@ -213,9 +248,8 @@ pub fn search_filtered<B: AsRef<[u8]>>(
     limit: usize,
     filters: &Filters,
 ) -> Result<Vec<Found>, QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit, filters, false)?;
-    helper.collect();
-    Ok(helper.render())
+    let options = Options { limit, filters: filters.clone(), ..Options::default() };
+    search_with(index, query, &options)
 }
 
 /// `search_filtered`, the query's last word taken as the start of one:
@@ -227,7 +261,17 @@ pub fn search_autocomplete<B: AsRef<[u8]>>(
     limit: usize,
     filters: &Filters,
 ) -> Result<Vec<Found>, QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit, filters, true)?;
+    let options = Options { limit, autocomplete: true, filters: filters.clone(), center: None };
+    search_with(index, query, &options)
+}
+
+/// addok's `search(q, limit=…, autocomplete=…, lat=…, lon=…, **filters)`.
+pub fn search_with<B: AsRef<[u8]>>(
+    index: &Index<B>,
+    query: &str,
+    options: &Options,
+) -> Result<Vec<Found>, QueryTooLong> {
+    let mut helper = Helper::new(index, query, options)?;
     helper.collect();
     Ok(helper.render())
 }
@@ -265,17 +309,15 @@ pub struct Order {
     pub candidates: Vec<String>,
 }
 
-/// `search_filtered`, or `search_autocomplete`, in the order given, and its
-/// trace.
+/// `search_with` in the order given, and its trace.
 pub fn search_traced<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
-    limit: usize,
-    filters: &Filters,
-    autocomplete: bool,
+    options: &Options,
     order: &Order,
 ) -> Result<(Vec<Found>, Trace), QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit, filters, autocomplete)?;
+    let filters = &options.filters;
+    let mut helper = Helper::new(index, query, options)?;
     helper.order = order.clone();
     helper.trace = Some(Tracing::default());
     helper.debug(|h| format!("Taken tokens: {}", tokens(&h.meaningful)));
@@ -317,9 +359,9 @@ fn tokens(tokens: &[Token]) -> String {
 
 /// Keys as addok logs them.
 fn keys(keys: &[String]) -> String {
-    let key = |key: &String| match key == FILTER_KEY {
-        true => format!("'{key}'"),
-        false => format!("'w|{key}'"),
+    let key = |key: &String| match is_word(key) {
+        true => format!("'w|{key}'"),
+        false => format!("'{key}'"),
     };
     let keys: Vec<String> = keys.iter().map(key).collect();
     format!("[{}]", keys.join(", "))
@@ -390,6 +432,11 @@ struct Helper<'i, B> {
     only_housenumber: bool,
     /// Whether the query's last word is taken as the start of one.
     autocomplete: bool,
+    /// The position to search around.
+    center: Option<Center>,
+    /// The documents of the cells around it, `GEOHASH_KEY` among the keys,
+    /// once computed: none when there is no position, or no document near.
+    geohash: Option<Option<Rc<[DocId]>>>,
     order: Order,
     trace: Option<Tracing>,
 }
@@ -400,10 +447,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     fn new(
         index: &'i Index<B>,
         query: &str,
-        wanted: usize,
-        filters: &Filters,
-        autocomplete: bool,
+        options: &Options,
     ) -> Result<Self, QueryTooLong> {
+        let (wanted, filters) = (options.limit, &options.filters);
         let query = text::fold(query);
         let processed = text::query_tokens(&query)?;
         let last = processed.len().checked_sub(1);
@@ -466,7 +512,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             filter: filters.documents(index).map(Rc::new),
             check_housenumber,
             only_housenumber,
-            autocomplete,
+            autocomplete: options.autocomplete,
+            center: options.center,
+            geohash: None,
             order: Order::default(),
             trace: None,
         })
@@ -483,10 +531,17 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         }
     }
 
-    /// addok's `RESULTS_COLLECTORS`, in order, until one says it is done;
-    /// less those that need a position.
+    /// addok's `RESULTS_COLLECTORS`, in order, until one says it is done.
     fn collect(&mut self) {
-        let collectors: [Collector<'i, B>; 10] = [
+        let collectors: [Collector<'i, B>; 13] = [
+            (
+                "ONLY_COMMONS_BUT_GEOHASH_TRY_AUTOCOMPLETE_COLLECTOR",
+                Self::only_commons_but_geohash_try_autocomplete,
+            ),
+            (
+                "NO_TOKENS_BUT_HOUSENUMBERS_AND_GEOHASH",
+                Self::no_tokens_but_housenumbers_and_geohash,
+            ),
             ("NO_AVAILABLE_TOKENS_ABORT", Self::no_available_tokens_abort),
             ("ONLY_COMMONS", Self::only_commons_collector),
             (
@@ -499,6 +554,10 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             ),
             ("BUCKET_WITH_MEANINGFUL", Self::bucket_with_meaningful),
             ("REDUCE_WITH_OTHER_COMMONS", Self::reduce_with_other_commons),
+            (
+                "ENSURE_GEOHASH_RESULTS_ARE_INCLUDED_IF_CENTER_IS_GIVEN",
+                Self::ensure_geohash_results_are_included_if_center_is_given,
+            ),
             (
                 "AUTOCOMPLETE_MEANINGFUL_COLLECTOR",
                 Self::autocomplete_meaningful,
@@ -531,6 +590,28 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         results.retain(|(_, scored)| scored.score >= MIN_SCORE);
         let result = |&(doc, scored)| self.result(doc, scored);
         results.iter().map(result).collect()
+    }
+
+    /// addok's `geohash_key`: whether documents lie in the cells around the
+    /// position, computed once. Not with a coordinate of 0, which Python
+    /// takes for false, nor a latitude python-geohash refuses.
+    fn geohash_key(&mut self) -> bool {
+        if self.geohash.is_none() {
+            let cell = self
+                .center
+                .filter(|center| center.lat != 0.0 && center.lon != 0.0)
+                .and_then(|center| geohash::encode(center.lat, center.lon));
+            self.geohash = Some(cell.and_then(|cell| {
+                let lists: Vec<&[DocId]> = geohash::expand(cell).into_iter().map(|cell| self.index.geohash(cell)).collect();
+                let docs = postings::union_sets(&lists);
+                self.debug(|_| match docs.is_empty() {
+                    true => "Empty geohash key".to_owned(),
+                    false => format!("Computed geohash key gx|{}", geohash::text(cell)),
+                });
+                (!docs.is_empty()).then(|| docs.into())
+            }));
+        }
+        matches!(self.geohash, Some(Some(_)))
     }
 
     fn bucket_full(&self) -> bool {
@@ -590,6 +671,13 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         if filter.is_some() {
             keys.push(FILTER_KEY.to_owned());
         }
+        let geohash = self.geohash.clone().flatten();
+        // A set alone gives all its members, as `SMEMBERS` does.
+        if let ([key], Some(geohash)) = (&keys[..], &geohash)
+            && key == GEOHASH_KEY
+        {
+            return geohash.to_vec();
+        }
         let limit = match usize::try_from(limit) {
             Ok(limit) if limit > 0 => limit,
             _ => self.wanted.max(BUCKET_MAX),
@@ -603,6 +691,12 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 && let Some(filter) = &filter
             {
                 lists.push(PostingList::set(filter));
+                continue;
+            }
+            if word == GEOHASH_KEY
+                && let Some(geohash) = &geohash
+            {
+                lists.push(PostingList::set(geohash));
                 continue;
             }
             match index.postings(word) {
@@ -634,10 +728,16 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     }
 
     fn add_to_bucket(&mut self, keys: &mut Vec<String>) {
+        self.add_to_bucket_up_to(keys, None);
+    }
+
+    /// `add_to_bucket`, to `limit` documents when given, as many as the
+    /// bucket holds otherwise.
+    fn add_to_bucket_up_to(&mut self, keys: &mut Vec<String>, limit: Option<i64>) {
         self.debug(|_| format!("Adding to bucket with keys {}", self::keys(keys)));
-        let words = keys.iter().filter(|key| *key != FILTER_KEY);
+        let words = keys.iter().filter(|key| is_word(key));
         self.matched_keys.extend(words.cloned());
-        let limit = BUCKET_MAX as i64 - self.bucket.len() as i64;
+        let limit = limit.unwrap_or(BUCKET_MAX as i64 - self.bucket.len() as i64);
         let found = self.intersect(keys, limit);
         self.bucket.extend(found);
         self.debug(|h| format!("{} ids in bucket so far", h.bucket.len()));
@@ -650,7 +750,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 self::keys(keys)
             )
         });
-        let words = keys.iter().filter(|key| *key != FILTER_KEY);
+        let words = keys.iter().filter(|key| is_word(key));
         self.matched_keys = words.cloned().collect();
         self.bucket = self.intersect(keys, limit).into_iter().collect();
         self.debug(|h| format!("{} ids in bucket so far", h.bucket.len()));
@@ -731,12 +831,31 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 }
             }
         }
-        // addok sums its scores and their ceilings in this order.
-        let score = (0.0 + importance + str_distance) / (0.0 + IMPORTANCE_WEIGHT + 1.0);
+        // addok's `score_by_geo_distance`: the distance to the position,
+        // the house number's when one matched.
+        let geo = self.center.map(|center| {
+            let position = match number {
+                Some(_) => index.housenumber_position(doc, &self.housenumber),
+                None => index.position(doc),
+            };
+            let (lat, lon) = position.expect("a BAN document has a position");
+            let km = haversine_distance((lat.value(), lon.value()), (center.lat, center.lon));
+            (km * 1000.0, km_to_score(km) * GEO_DISTANCE_WEIGHT)
+        });
+        // addok sums its scores and their ceilings in this order, with
+        // Python's `sum`.
+        let score = match geo {
+            None => python_sum(&[importance, str_distance]) / python_sum(&[IMPORTANCE_WEIGHT, 1.0]),
+            Some((_, geo)) => {
+                python_sum(&[importance, str_distance, geo])
+                    / python_sum(&[IMPORTANCE_WEIGHT, 1.0, GEO_DISTANCE_WEIGHT])
+            }
+        };
         Some(Scored {
             importance,
             str_distance,
             score,
+            distance: geo.map(|(distance, _)| distance),
         })
     }
 
@@ -767,7 +886,38 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             importance: scored.importance,
             str_distance: scored.str_distance,
             score: scored.score,
+            distance: scored.distance,
         }
+    }
+
+    /// addok's `only_commons_but_geohash_try_autocomplete_collector`, which
+    /// autocompletes whether autocomplete is on or not.
+    fn only_commons_but_geohash_try_autocomplete(&mut self) -> bool {
+        if self.geohash_key() && self.only_commons() {
+            let tokens = self.tokens.clone();
+            self.autocomplete(&tokens, false, true);
+        }
+        false
+    }
+
+    /// addok's `no_tokens_but_housenumbers_and_geohash`: a house number
+    /// alone looks around the position.
+    fn no_tokens_but_housenumbers_and_geohash(&mut self) -> bool {
+        if self.tokens.is_empty() && !self.housenumber.is_empty() && self.geohash_key() {
+            self.new_bucket(&mut vec![GEOHASH_KEY.to_owned()], BUCKET_MIN as i64);
+        }
+        false
+    }
+
+    /// addok's `ensure_geohash_results_are_included_if_center_is_given`.
+    fn ensure_geohash_results_are_included_if_center_is_given(&mut self) -> bool {
+        if self.bucket_overflow() && self.geohash_key() {
+            self.debug(|_| "Bucket overflow and center, force nearby look up".to_owned());
+            let mut keys = self.keys.clone();
+            keys.push(GEOHASH_KEY.to_owned());
+            self.add_to_bucket_up_to(&mut keys, Some(self.wanted.max(BUCKET_MIN) as i64));
+        }
+        false
     }
 
     fn no_available_tokens_abort(&mut self) -> bool {
@@ -785,7 +935,12 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             .iter()
             .map(|token| token.value.clone())
             .collect();
-        if keys.len() == 1 {
+        let geohash = self.geohash_key();
+        if geohash {
+            keys.push(GEOHASH_KEY.to_owned());
+            self.debug(|_| "Adding geohash".to_owned());
+        }
+        if keys.len() == 1 || geohash {
             self.add_to_bucket(&mut keys);
         }
         if self.bucket_dry() && keys.len() > 1 {
@@ -862,7 +1017,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         }
         self.debug(|_| "Only commons, trying autocomplete".to_owned());
         let common = self.common.clone();
-        self.autocomplete(&common, false);
+        self.autocomplete(&common, false, false);
         self.meaningful = self.common[..1].to_vec();
         if !self.pass_should_match_threshold() {
             return false;
@@ -875,7 +1030,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             return false;
         }
         let tokens = self.tokens.clone();
-        self.autocomplete(&tokens, true);
+        self.autocomplete(&tokens, true, false);
         if !self.bucket_empty() {
             self.debug(|_| "Only common terms. Return.".to_owned());
         }
@@ -893,13 +1048,17 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             return false;
         }
         let meaningful = self.meaningful.clone();
-        self.autocomplete(&meaningful, false);
+        if self.geohash_key() {
+            self.autocomplete(&meaningful, false, true);
+        }
+        self.autocomplete(&meaningful, false, false);
         false
     }
 
     /// addok's `autocomplete`: the tokens the last one begins that share a
     /// document with every other, each tried with the others.
-    fn autocomplete(&mut self, tokens: &[Token], skip_commons: bool) {
+    /// With `use_geohash`, each word is tried with the geohash key too.
+    fn autocomplete(&mut self, tokens: &[Token], skip_commons: bool, use_geohash: bool) {
         let index = self.index;
         let Some(last) = self.last_token.clone() else {
             return;
@@ -948,6 +1107,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 self.debug(|_| format!("Trying to extend bucket. Autocomplete w|{word}"));
                 let mut extended = keys.clone();
                 extended.push(word.to_owned());
+                if use_geohash && self.geohash_key() {
+                    extended.push(GEOHASH_KEY.to_owned());
+                }
                 self.add_to_bucket(&mut extended);
             }
         }
@@ -1337,6 +1499,47 @@ impl QueryBigrams {
     }
 }
 
+/// Python 3.12's `sum` of floats, from 0: compensated (Neumaier), so that
+/// three terms may round otherwise than added in turn: `0.1 + 1.0 + 0.1`
+/// gives 1.2000000000000002, their `sum` 1.2.
+pub(crate) fn python_sum(terms: &[f64]) -> f64 {
+    let (mut sum, mut compensation) = (0.0f64, 0.0f64);
+    for &term in terms {
+        let total = sum + term;
+        compensation += match sum.abs() >= term.abs() {
+            true => (sum - total) + term,
+            false => (term - total) + sum,
+        };
+        sum = total;
+    }
+    if compensation != 0.0 && compensation.is_finite() {
+        sum += compensation;
+    }
+    sum
+}
+
+/// addok's `haversine_distance`: the great-circle distance between two
+/// positions, latitude then longitude, in kilometres, on a sphere of radius
+/// 6,367 km.
+pub(crate) fn haversine_distance((lat1, lon1): (f64, f64), (lat2, lon2): (f64, f64)) -> f64 {
+    let (lon1, lat1, lon2, lat2) = (lon1.to_radians(), lat1.to_radians(), lon2.to_radians(), lat2.to_radians());
+    let (dlon, dlat) = (lon2 - lon1, lat2 - lat1);
+    let a = squared((dlat / 2.0).sin()) + lat1.cos() * lat2.cos() * squared((dlon / 2.0).sin());
+    let c = 2.0 * a.sqrt().asin();
+    6367.0 * c
+}
+
+/// addok's `km_to_score`: 1 at the position, falling to 0 past 100 km.
+pub(crate) fn km_to_score(km: f64) -> f64 {
+    if km > 100.0 { 0.0 } else { (-squared(km / 50.0)).exp() }
+}
+
+/// Python's `x ** 2`: the C library's `pow`, which need not round as
+/// `x * x` does, and which the compiler would otherwise turn into it.
+fn squared(x: f64) -> f64 {
+    x.powf(std::hint::black_box(2.0))
+}
+
 /// A bigram of folded text, two ASCII bytes, as 14 bits.
 fn bigram(pair: &[u8]) -> usize {
     debug_assert!(pair.is_ascii(), "folded strings are ASCII");
@@ -1583,6 +1786,80 @@ mod tests {
         Index::open(bytes).unwrap()
     }
 
+    /// Rue Lima in Paris, with a number 4, and in Lyon, each where it is.
+    fn paris_and_lyon() -> Index<crate::index::AlignedBytes> {
+        let street = |id: &str, postcode: &str, city: &str, lat: f64, lon: f64, numbers: &str| {
+            Document::from_ndjson(&format!(
+                r#"{{"id":"{id}","banId":null,"type":"street","name":"Rue Lima","postcode":"{postcode}","citycode":"{}","city":"{city}","context":"","x":0,"y":0,"lon":{lon},"lat":{lat},"importance":0.5,"housenumbers":{{{numbers}}}}}"#,
+                &id[..5]
+            ))
+            .unwrap()
+        };
+        let four = r#""4":{"id":"75101_0001_00004","banId":null,"x":0,"y":0,"lon":2.3401,"lat":48.8601}"#;
+        let streets = [
+            street("75101_0001", "75001", "Paris", 48.86, 2.34, four),
+            street("69381_0001", "69001", "Lyon", 45.76, 4.83, ""),
+        ];
+        let mut bytes = crate::index::AlignedBytes::default();
+        crate::index::write(streets, &mut bytes).unwrap();
+        Index::open(bytes).unwrap()
+    }
+
+    #[test]
+    fn scores_the_distance_to_the_position_searched_around() {
+        let index = paris_and_lyon();
+        let near = |lat: f64, lon: f64| Options { limit: 3, center: Some(Center { lat, lon }), ..Options::default() };
+        let found = search_with(&index, "rue lima", &near(45.7601, 4.8301)).unwrap();
+        assert_eq!(ids(&found), ["69381_0001", "75101_0001"]);
+        // addok's score: importance, label, then distance, over their
+        // ceilings; nothing for the distance past 100 km.
+        let lyon = &found[0];
+        let km = haversine_distance((45.76, 4.83), (45.7601, 4.8301));
+        let geo = km_to_score(km) * GEO_DISTANCE_WEIGHT;
+        assert_eq!(lyon.score, python_sum(&[lyon.importance, lyon.str_distance, geo]) / 1.2);
+        assert_eq!(lyon.distance, Some(km * 1000.0));
+        let paris = &found[1];
+        assert!(paris.distance.unwrap() > 390_000.0);
+        assert_eq!(paris.score, python_sum(&[paris.importance, paris.str_distance, 0.0]) / 1.2);
+        // Without a position, no distance, and the score addok-csv gives.
+        let anywhere = search_filtered(&index, "rue lima", 3, &Filters::default()).unwrap();
+        assert!(anywhere.iter().all(|found| found.distance.is_none()));
+    }
+
+    #[test]
+    fn squares_as_python() {
+        // CPython 3.12.3's `sin(dlon / 2) ** 2`, and its distance, on macOS,
+        // where `pow` does not round as a product does here.
+        let x = (((-1.27112f64).to_radians() - (-1.380786f64).to_radians()) / 2.0).sin();
+        let distance = haversine_distance((45.990167, -1.380786), (45.994359, -1.27112)) * 1000.0;
+        if cfg!(target_os = "macos") {
+            assert_ne!(squared(x), x * x);
+            assert_eq!(distance, 8479.54453403133);
+        }
+    }
+
+    #[test]
+    fn sums_as_python_3_12() {
+        // CPython 3.12.3's own answers.
+        assert_eq!(python_sum(&[0.1, 1.0, 0.1]), 1.2);
+        assert_eq!(0.1 + 1.0 + 0.1, 1.2000000000000002);
+        assert_eq!(python_sum(&[0.1, 1.0]), 1.1);
+        assert_eq!(python_sum(&[]), 0.0);
+    }
+
+    #[test]
+    fn finds_a_lone_house_number_around_the_position() {
+        let index = paris_and_lyon();
+        let near = |lat: f64, lon: f64| Options { limit: 3, center: Some(Center { lat, lon }), ..Options::default() };
+        let found = search_with(&index, "4", &near(48.8601, 2.3401)).unwrap();
+        assert_eq!(ids(&found), ["75101_0001_00004"]);
+        assert_eq!(found[0].distance, Some(0.0));
+        assert!(search_with(&index, "4", &near(43.3, 5.4)).unwrap().is_empty());
+        // Python takes a coordinate of 0 for no position: no cell, so
+        // nothing for a house number alone.
+        assert!(search_with(&index, "4", &near(48.8601, 0.0)).unwrap().is_empty());
+    }
+
     #[test]
     fn tries_autocomplete_s_words_of_equal_score_in_the_order_given() {
         let street = |id: &str, city: &str| {
@@ -1597,7 +1874,8 @@ mod tests {
         let index = Index::open(bytes).unwrap();
         let tried = |candidates: &[&str]| {
             let order = Order { candidates: candidates.iter().map(|&word| word.to_owned()).collect(), ..Order::default() };
-            let (_, trace) = search_traced(&index, "rue lima mon", 3, &Filters::default(), true, &order).unwrap();
+            let options = Options { limit: 3, autocomplete: true, ..Options::default() };
+            let (_, trace) = search_traced(&index, "rue lima mon", &options, &order).unwrap();
             let steps = trace.steps.iter().filter(|step| step.starts_with("Trying to extend bucket"));
             steps.map(|step| step.rsplit('|').next().unwrap().to_owned()).collect::<Vec<_>>()
         };
@@ -1694,7 +1972,7 @@ mod tests {
         // hundred: the order picks the two it drops.
         let index = index(&["Lima"; 102]);
         let ids = |order: &Order| {
-            let (found, trace) = search_traced(&index, "lima", 3, &Filters::default(), false, order).unwrap();
+            let (found, trace) = search_traced(&index, "lima", &Options { limit: 3, ..Options::default() }, order).unwrap();
             assert_eq!(trace.tied.len(), 102);
             let ids: Vec<String> = found.iter().map(|found| found.id().to_owned()).collect();
             ids
@@ -1713,7 +1991,7 @@ mod tests {
         // so a token joins the group of whichever neighbour comes first.
         let index = index(&["Lima Oslo", "Oslo Rome", "Rome Kiev", "Kiev Lima"]);
         let groups = |order: &Order| {
-            let (_, trace) = search_traced(&index, "lima oslo rome kiev", 3, &Filters::default(), false, order).unwrap();
+            let (_, trace) = search_traced(&index, "lima oslo rome kiev", &Options { limit: 3, ..Options::default() }, order).unwrap();
             let steps = trace.steps.into_iter();
             let keys = steps.filter_map(|step| {
                 let keys = step.strip_prefix("Adding to bucket with keys ");

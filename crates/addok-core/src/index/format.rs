@@ -96,6 +96,9 @@ kinds! {
     NumberTokens = 39: u8,
     NumberTokenOffsets = 40: u32,
     WordTable = 41: u32,
+    GeohashCells = 42: u64,
+    GeohashOffsets = 43: u32,
+    Geohashes = 44: u32,
 }
 
 /// Writes sections, then their table and the trailer.

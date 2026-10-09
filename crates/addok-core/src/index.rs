@@ -223,6 +223,38 @@ impl<B: AsRef<[u8]>> Index<B> {
         self.number(doc, encoding::IMPORTANCE)
     }
 
+    /// A document's position, `lat` and `lon`.
+    pub fn position(&self, doc: DocId) -> Option<(Number, Number)> {
+        self.number(doc, encoding::LAT).zip(self.number(doc, encoding::LON))
+    }
+
+    /// The position of a street's house number by its token, `lat` and
+    /// `lon`: `housenumber`'s, without the rest.
+    pub fn housenumber_position(&self, doc: DocId, token: &str) -> Option<(Number, Number)> {
+        let (position, _) = self.find_housenumber(doc, token)?;
+        let coordinates = self.housenumber_coordinates(position);
+        Some((coordinates[3], coordinates[2]))
+    }
+
+    /// A house number's x, y, lon and lat, as the NDJSON writes them.
+    fn housenumber_coordinates(&self, position: usize) -> [Number; 4] {
+        let flags = self.array::<u8>(Kind::HnFlags)[position];
+        let values: [f64; 4] = if flags & encoding::HN_COORDINATES_EXCEPTION != 0 {
+            let indexes: &[u32] = self.array(Kind::HnCoordinateExceptionIndexes);
+            let found = indexes
+                .binary_search(&(position as u32))
+                .expect("an entry, as the flag says");
+            self.array::<[f64; 4]>(Kind::HnCoordinateExceptions)[found]
+        } else {
+            let units = self.array::<[i32; 4]>(Kind::HnCoordinates)[position];
+            std::array::from_fn(|i| f64::from(units[i]) / encoding::SCALES[i])
+        };
+        std::array::from_fn(|i| match flags & (1 << i) {
+            0 => Number::Float(values[i]),
+            _ => Number::Integer(values[i] as i64),
+        })
+    }
+
     /// A document's text field, by its place in `encoding::texts_mut`.
     fn text(&self, doc: DocId, field: usize) -> TextRef<'_> {
         let strings = self.strings(Kind::Strings, Kind::StringOffsets);
@@ -255,6 +287,27 @@ impl<B: AsRef<[u8]>> Index<B> {
         self.find_housenumber(doc, token).map(|(_, number)| number)
     }
 
+    /// A street's house numbers, those addok keeps (one per token), by
+    /// token: each one's place among the index's, its `lat` and `lon`.
+    pub fn housenumber_positions(&self, doc: DocId) -> impl Iterator<Item = (usize, Number, Number)> + '_ {
+        let ends: &[u32] = self.array(Kind::DocHouseNumbers);
+        let (start, end) = (ends[doc as usize] as usize, ends[doc as usize + 1] as usize);
+        (start..end).map(|at| {
+            let [_, _, lon, lat] = self.housenumber_coordinates(at);
+            (at, lat, lon)
+        })
+    }
+
+    /// A street's house number by its place among the index's, as
+    /// `housenumber_positions` gives it.
+    pub fn housenumber_at(&self, doc: DocId, at: usize) -> HouseNumber {
+        let number = self
+            .strings(Kind::NumberWritten, Kind::NumberWrittenOffsets)
+            .get(self.array::<u32>(Kind::HnNumbers)[at] as usize)
+            .to_owned();
+        self.housenumber_built(doc, at, number)
+    }
+
     /// Where `housenumber` finds a street's house number, and its number.
     fn find_housenumber(&self, doc: DocId, token: &str) -> Option<(usize, &str)> {
         let ends: &[u32] = self.array(Kind::DocHouseNumbers);
@@ -280,7 +333,11 @@ impl<B: AsRef<[u8]>> Index<B> {
     /// street's last, as in addok.
     pub fn housenumber(&self, doc: DocId, token: &str) -> Option<HouseNumber> {
         let (position, number) = self.find_housenumber(doc, token)?;
-        let number = number.to_owned();
+        Some(self.housenumber_built(doc, position, number.to_owned()))
+    }
+
+    /// The house number at `position` among the index's, its number given.
+    fn housenumber_built(&self, doc: DocId, position: usize, number: String) -> HouseNumber {
         let at = position as u32;
         let flags = self.array::<u8>(Kind::HnFlags)[position];
         let id = match flags & encoding::HN_ID_EXCEPTION {
@@ -294,29 +351,16 @@ impl<B: AsRef<[u8]>> Index<B> {
         } else {
             Some(encoding::uuid_text(&self.array(Kind::HnBanIds)[position]))
         };
-        let values: [f64; 4] = if flags & encoding::HN_COORDINATES_EXCEPTION != 0 {
-            let indexes: &[u32] = self.array(Kind::HnCoordinateExceptionIndexes);
-            let found = indexes
-                .binary_search(&at)
-                .expect("an entry, as the flag says");
-            self.array::<[f64; 4]>(Kind::HnCoordinateExceptions)[found]
-        } else {
-            let units = self.array::<[i32; 4]>(Kind::HnCoordinates)[position];
-            std::array::from_fn(|i| f64::from(units[i]) / encoding::SCALES[i])
-        };
-        let coordinate = |i: usize| match flags & (1 << i) {
-            0 => Number::Float(values[i]),
-            _ => Number::Integer(values[i] as i64),
-        };
-        Some(HouseNumber {
+        let [x, y, lon, lat] = self.housenumber_coordinates(position);
+        HouseNumber {
             number,
             id,
             ban_id,
-            x: coordinate(0),
-            y: coordinate(1),
-            lon: coordinate(2),
-            lat: coordinate(3),
-        })
+            x,
+            y,
+            lon,
+            lat,
+        }
     }
 
     /// A word's number, if a document holds it.
@@ -358,6 +402,21 @@ impl<B: AsRef<[u8]>> Index<B> {
             Some(i) => self.list(Kind::NgramOffsets, Kind::Ngrams, i),
             None => &[],
         }
+    }
+
+    /// The documents filed under a cell, ascending, addok's `g|<geohash>`:
+    /// those lying in it, and the streets with a house number there.
+    pub fn geohash(&self, cell: crate::geohash::Cell) -> &[DocId] {
+        let cells: &[u64] = self.array(Kind::GeohashCells);
+        match cells.binary_search(&cell) {
+            Ok(i) => self.list(Kind::GeohashOffsets, Kind::Geohashes, i),
+            Err(_) => &[],
+        }
+    }
+
+    /// How many cells documents lie in.
+    pub fn geohash_cells(&self) -> usize {
+        self.array::<u64>(Kind::GeohashCells).len()
     }
 
     /// The documents a filter holds, ascending, addok's `f|<name>|<value>`.
@@ -662,6 +721,55 @@ mod tests {
         assert_eq!(index.filter("citycode", "01002"), [0, 1]);
         assert_eq!(index.filter("postcode", "01640"), [0, 1]);
         assert!(index.filter("postcode", "75002").is_empty());
+    }
+
+    #[test]
+    fn files_documents_and_house_numbers_under_their_cells() {
+        use crate::geohash::encode;
+        let at = |lat: f64, lon: f64| encode(lat, lon).unwrap();
+        let placed = |document: Document, lat: f64, lon: f64| Document {
+            lat: Some(Number::Float(lat)),
+            lon: Some(Number::Float(lon)),
+            ..document
+        };
+        let numbered = Document {
+            housenumbers: Some(vec![housenumber("16", "01002_0110_00016")]),
+            ..placed(street(), 46.007342, 5.421924)
+        };
+        let nameless = Document {
+            id: "01002_0111".into(),
+            name: one(""),
+            housenumbers: Some(vec![housenumber("2", "01002_0111_00002")]),
+            ..placed(street(), 48.8566, 2.3522)
+        };
+        // Numbered by importance, then id: the two streets, the municipality.
+        let index = build(vec![numbered, placed(municipality(), 46.008573, 5.420189), nameless]);
+        // A street lies in its own cell, and in its house numbers'.
+        assert!(index.geohash(at(46.007342, 5.421924)).contains(&0));
+        assert!(index.geohash(at(46.006992, 5.423167)).contains(&0));
+        assert!(index.geohash(at(46.008573, 5.420189)).contains(&2));
+        // addok refuses an unnamed document once its house numbers are filed.
+        assert!(index.geohash(at(46.006992, 5.423167)).contains(&1));
+        assert!(index.geohash(at(48.8566, 2.3522)).is_empty());
+    }
+
+    #[test]
+    fn files_only_the_house_number_addok_keeps_of_a_token() {
+        use crate::geohash::encode;
+        let at = |lat: f64, lon: f64| encode(lat, lon).unwrap();
+        let elsewhere = HouseNumber {
+            lat: Number::Float(45.0),
+            lon: Number::Float(4.0),
+            ..housenumber("50bis", "01002_0110_00050_bis")
+        };
+        // `50bis` and `50B` share the token `50b`: the street's last is kept.
+        let numbered = Document {
+            housenumbers: Some(vec![elsewhere, housenumber("50B", "01002_0110_00050_b")]),
+            ..street()
+        };
+        let index = build(vec![numbered]);
+        assert!(index.geohash(at(45.0, 4.0)).is_empty());
+        assert_eq!(index.geohash(at(46.006992, 5.423167)), [0]);
     }
 
     #[test]

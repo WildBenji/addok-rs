@@ -22,12 +22,13 @@ addok-rs géocode des adresses françaises, par lots, à partir de la Base Adres
 
 ## 1. Choisir son mode d'utilisation
 
-addok-rs est un seul programme, `addok-cli`, avec trois commandes :
+addok-rs est un seul programme, `addok-cli`, avec quatre commandes :
 
 | Commande | Rôle |
 |---|---|
-| `addok-cli build` | Construit l'index à partir de l'export de la BAN : 85 s, un fichier de 1,86 Go. |
+| `addok-cli build` | Construit l'index à partir de l'export de la BAN : environ 90 s, un fichier de 1,94 Go. |
 | `addok-cli batch` | Géocode un fichier entier, Parquet ou CSV, sur tous les cœurs, sans serveur. |
+| `addok-cli reverse` | Trouve l'adresse de chaque position d'un fichier, Parquet ou CSV, sans serveur. |
 | `addok-cli serve` | Sert l'index en HTTP, sur le port 7878 comme addok. |
 
 Quel que soit le mode, il faut d'abord [construire l'index](#3-construire-lindex). Ensuite :
@@ -37,6 +38,7 @@ Quel que soit le mode, il faut d'abord [construire l'index](#3-construire-lindex
 | Géocoder un fichier sur la machine où il se trouve | [`addok-cli batch`](#4-géocoder-un-fichier-en-local--addok-cli-batch) : ni réseau, ni découpage à gérer |
 | Offrir le géocodage à d'autres programmes ou d'autres machines | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`/batch`](#post-batch) |
 | Chercher une adresse à la fois depuis une application | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`GET /search`](#get-search) |
+| Trouver l'adresse d'une position (géocodage inverse) | [`addok-cli reverse`](#géocodage-inverse--addok-cli-reverse) pour un fichier, ou [`GET /reverse`](#get-reverse), [`/reverse/csv`](#post-reversecsv) et [`/reverse/batch`](#post-reversebatch) |
 | Remplacer un addok existant sans toucher à ses clients | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`/search/csv`](#post-searchcsv) (voir [Passer d'addok à addok-rs](#11-passer-daddok-à-addok-rs)) |
 
 ---
@@ -74,7 +76,7 @@ Dans la suite, `addok-cli` désigne ce binaire.
 
 | | Construction de l'index | Géocodage |
 |---|---|---|
-| **Mémoire** | environ 3 Go (pic mesuré : 2,7 Go) | de quoi garder en cache l'essentiel de l'index (1,86 Go), en plus du reste |
+| **Mémoire** | environ 3 Go (pic mesuré : 2,7 Go) | de quoi garder en cache l'essentiel de l'index (1,94 Go), en plus du reste |
 | **Disque** | 1,3 Go pour l'export de la BAN, 1,9 Go pour l'index | 1,9 Go pour l'index |
 | **Cœurs** | un seul | tous ceux disponibles, ou `--cores N` |
 
@@ -112,7 +114,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" --entrypoint addok-cl
 L'option `--user` fait écrire l'index sous votre utilisateur plutôt que sous celui de l'image. La construction affiche :
 
 ```
-ban.addok: 1.86 GB in 41 sections, written in 85s
+ban.addok: 1.94 GB in 44 sections, written in 88s
 ```
 
 - **L'export peut être compressé ou non :** `build` lit le `.ndjson.gz` tel quel, ou un `.ndjson` décompressé.
@@ -128,7 +130,7 @@ Le format de l'index peut gagner des sections d'une version à l'autre. Un index
 ban.addok: index without a WordTable section: written by an older addok-rs, or damaged; rebuild it with `addok-cli build`
 ```
 
-Il suffit de relancer `addok-cli build`.
+Il suffit de relancer `addok-cli build`. C'est le cas en passant à addok-rs 0.11 : l'index y gagne les cellules géographiques de la [recherche autour d'un point](#chercher-autour-dun-point).
 
 ---
 
@@ -168,6 +170,7 @@ Le fichier de sortie reprend **toutes les lignes et toutes les colonnes** du fic
 | `--postcode-fallback on` | Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) quand le code postal est faux | désactivé |
 | `--result-columns A,B` | Ajoute le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) : `result_num`, `result_num_complement`, `result_num_complement_short` | aucune |
 | `--filters F=COL,F=COL` | [Filtre](#filtrer-les-résultats) chaque ligne par la valeur de la colonne `COL`, pour chaque filtre `F` : `type`, `citycode` ou `postcode` | aucun |
+| `--lat COL --lon COL` | [Cherche chaque ligne autour du point](#chercher-autour-dun-point) que donnent ces deux colonnes | aucun point |
 | `--cores N` | Nombre de cœurs à utiliser, de 1 au nombre disponible | tous |
 
 Les extensions reconnues sont `.parquet` et `.pq` pour Parquet, `.csv` et `.txt` pour CSV. Pour tout autre nom, il faut préciser `--input-format` ou `--output-format`.
@@ -202,6 +205,21 @@ La requête d'une ligne est la **jointure, avec une espace, des colonnes donnée
 - **Parquet :** les colonnes d'entrée gardent leur type (un identifiant entier reste entier), et le fichier de sortie est compressé en zstd.
 - **CSV en entrée :** UTF-8, avec ou sans marque d'ordre d'octets (BOM). La première ligne donne les noms de colonnes. Les champs entre guillemets peuvent contenir le séparateur ou des sauts de ligne. Toutes les colonnes sont lues comme du texte ; le CSV ne sait pas distinguer une valeur vide d'une valeur nulle.
 - **CSV en sortie :** UTF-8 sans BOM, une ligne d'en-tête, guillemets seulement quand c'est nécessaire, fins de ligne `\n`.
+
+### Géocodage inverse : `addok-cli reverse`
+
+`addok-cli reverse` trouve l'adresse la plus proche de chaque position d'un fichier, comme le `/reverse/csv` d'addok-csv, sans serveur :
+
+```sh
+addok-cli reverse ban.addok positions.parquet adresses.parquet
+addok-cli reverse ban.addok positions.csv adresses.csv --lat y --lon x --nearest on
+```
+
+- **La position** est lue dans les colonnes que trouve addok-csv : `latitude` ou `lat`, puis `longitude`, `lon`, `lng` ou `long`. `--lat` et `--lon` en nomment d'autres. Une colonne numérique Parquet est lue telle quelle, une colonne texte comme un nombre.
+- **Une ligne sans position,** ou dont la position n'est pas faite de nombres, reste sans résultat, comme dans addok-csv. Une latitude hors de [-90, 90) fait refuser le fichier, en nommant sa ligne.
+- **Les colonnes de résultat** sont celles de `/reverse/csv` : `result_latitude`, `result_longitude`, `result_label`, `result_distance` (en mètres entiers), `result_type`, `result_id`, `result_housenumber`, puis les champs de l'adresse. En Parquet, coordonnées et distance sont des nombres, et une ligne sans résultat a des cellules nulles.
+- **`--nearest on`** cherche l'[adresse la plus proche](#ladresse-la-plus-proche--nearest), où qu'elle soit dans le rayon `--radius` (en mètres, 5 000 par défaut, 10 000 au plus), là où addok ne cherche qu'aux alentours immédiats.
+- **`--filters`**, les formats, les séparateurs et `--cores` s'emploient comme pour `addok-cli batch`.
 
 ---
 
@@ -253,7 +271,7 @@ services:
 
 - **Les cœurs :** par défaut, tous ceux que le conteneur peut utiliser, limite `--cpus` comprise. Tout argument placé après le nom de l'image s'ajoute à `serve`, donc `docker run … ghcr.io/wildbenji/addok-rs --cores 4` en prend 4.
 - **Un autre nom d'index :** remplacer la commande, par exemple `docker run … --entrypoint addok-cli ghcr.io/wildbenji/addok-rs serve /data/autre.addok --host 0.0.0.0`.
-- **La mémoire :** l'image n'en fixe aucune limite. L'index (1,86 Go) est projeté en mémoire, et le système garde en cache ce qu'il en lit, jusqu'à environ 1,9 Go en charge. Si le conteneur a une limite mémoire, prévoyez de quoi garder l'index en cache en plus du reste : sous la limite, le système l'évince, et chaque recherche attend alors le disque.
+- **La mémoire :** l'image n'en fixe aucune limite. L'index (1,94 Go) est projeté en mémoire, et le système garde en cache ce qu'il en lit, jusqu'à environ 1,9 Go en charge. Si le conteneur a une limite mémoire, prévoyez de quoi garder l'index en cache en plus du reste : sous la limite, le système l'évince, et chaque recherche attend alors le disque.
 - **L'arrêt :** `docker stop` arrête le serveur proprement, après les requêtes en cours.
 - **Pas de `HEALTHCHECK` dans l'image,** qui n'a pas curl : interrogez [`/health`](#get-health) depuis l'extérieur.
 - **Construire l'image soi-même :** `docker build -t addok-rs .` à la racine du dépôt, sans BuildKit ni buildx, pour l'architecture de la machine.
@@ -267,9 +285,12 @@ services:
 | [`POST /batch`](#post-batch) | Géocode un fichier Parquet ou CSV et le rend en Parquet ou CSV. L'interface à privilégier. |
 | [`POST /search/csv`](#post-searchcsv) | Le point d'entrée d'addok-csv, à l'octet près, pour les clients d'addok existants. |
 | [`GET /search`](#get-search) | Le point d'entrée JSON d'addok : une adresse par requête, les résultats en GeoJSON. |
+| [`POST /reverse/batch`](#post-reversebatch) | L'adresse de chaque position d'un fichier Parquet ou CSV, rendu en Parquet ou CSV. |
+| [`POST /reverse/csv`](#post-reversecsv) | Le géocodage inverse d'addok-csv, pour les clients d'addok existants. |
+| [`GET /reverse`](#get-reverse) | Le géocodage inverse d'addok : une position par requête, les adresses les plus proches en GeoJSON. |
 | [`GET /health`](#get-health) | Dit si le serveur répond, avec l'index chargé et la version. |
 
-Les deux points d'entrée qui géocodent un fichier reçoivent un formulaire `multipart/form-data` : le fichier dans le champ `data`, et chaque paramètre dans son propre champ. Seuls les champs du formulaire comptent : les paramètres passés dans l'URL sont ignorés, comme dans addok-csv.
+Les points d'entrée qui reçoivent un fichier reçoivent un formulaire `multipart/form-data` : le fichier dans le champ `data`, et chaque paramètre dans son propre champ. Seuls les champs du formulaire comptent : les paramètres passés dans l'URL sont ignorés, comme dans addok-csv.
 
 ### `POST /batch`
 
@@ -287,11 +308,25 @@ Les deux points d'entrée qui géocodent un fichier reçoivent un formulaire `mu
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (`true`, `on` et `yes` valent aussi) | désactivé |
 | `result_columns` | Une colonne de résultat en plus ; répéter le champ pour chacune : `result_num`, `result_num_complement`, `result_num_complement_short` ([numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte)). Les autres noms sont ignorés | aucune |
 | `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne | aucun filtre |
+| `lat`, `lon` | Le nom des colonnes du [point autour duquel chercher](#chercher-autour-dun-point) chaque ligne | aucun point |
 
 **La réponse** est le fichier géocodé, en `application/vnd.apache.parquet` ou en `text/csv; charset=utf-8`, proposé sous le nom `<nom-envoyé>.geocoded.parquet` (ou `.csv`).
 
 - **Une requête trop longue ne fait pas échouer le fichier.** Au-delà de 200 caractères, elle est refusée par le moteur, comme dans addok, mais seule sa ligne reste sans résultat. La réponse le signale par l'en-tête [`X-Addok-Warning`](#len-tête-x-addok-warning).
 - **Les résultats prennent la place des colonnes homonymes.** Si le fichier d'entrée contient déjà une colonne portant le nom d'une colonne de résultat (`result_label`, par exemple), elle est remplacée.
+
+### `POST /reverse/batch`
+
+`POST /reverse/batch` fait la même chose qu'[`addok-cli reverse`](#géocodage-inverse--addok-cli-reverse), à travers HTTP. Il prend le fichier dans `data`, et les champs `input_format`, `output_format`, `input_delimiter` et `output_delimiter` de [`/batch`](#post-batch), ainsi que :
+
+| Champ | Rôle | Par défaut |
+|---|---|---|
+| `lat`, `lon` | Les colonnes de la position | `latitude` ou `lat`, puis `longitude`, `lon`, `lng` ou `long` |
+| `nearest` | `1` pour l'[adresse la plus proche](#ladresse-la-plus-proche--nearest) dans le rayon | désactivé |
+| `radius` | Le rayon de `nearest`, en mètres, jusqu'à 10 000 | `5000` |
+| `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne | aucun filtre |
+
+**La réponse** est le fichier, chaque ligne suivie des colonnes de résultat de `/reverse/csv`, typées en Parquet, proposé sous le nom `<nom-envoyé>.geocoded.parquet` (ou `.csv`).
 
 ### `POST /search/csv`
 
@@ -309,6 +344,7 @@ Les deux points d'entrée qui géocodent un fichier reçoivent un formulaire `mu
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (propre à addok-rs) | désactivé |
 | `result_columns` | Comme dans `/batch` : seuls `result_num`, `result_num_complement` et `result_num_complement_short` ajoutent une colonne, après les 16 d'addok-csv (propre à addok-rs). Les autres noms ne changent rien, comme dans addok-csv | aucune |
 | `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne, comme dans addok-csv | aucun filtre |
+| `lat`, `lon` | Le nom des colonnes du [point autour duquel chercher](#chercher-autour-dun-point) chaque ligne, comme dans addok-csv | aucun point |
 
 **La réponse :**
 
@@ -328,13 +364,15 @@ Les deux points d'entrée qui géocodent un fichier reçoivent un formulaire `mu
 
 Avec addok 1.3.2, addok-csv 1.1.0 échoue dès qu'on lui passe un filtre. addok-rs applique les filtres comme addok-csv l'entend : chaque champ nomme une colonne, dont la valeur filtre sa ligne (voir [Filtrer les résultats](#filtrer-les-résultats)).
 
-#### Paramètres refusés
+### `POST /reverse/csv`
 
-Le géocodage autour d'un point (`lat`, `lon`) n'est pas encore porté. Plutôt que de l'ignorer en silence, addok-rs refuse la requête avec une erreur 400 :
+`POST /reverse/csv` reproduit le point d'entrée de géocodage inverse d'addok-csv 1.1.0 : chaque ligne du fichier reçoit l'adresse la plus proche de sa position, lue dans ses colonnes `latitude` ou `lat`, et `longitude`, `lon`, `lng` ou `long`. Il prend les champs `data`, `columns`, `delimiter`, `quote`, `encoding` et `with_bom` de [`/search/csv`](#post-searchcsv), les filtres comme noms de colonnes, et, propres à addok-rs, `nearest` et `radius` comme [`/reverse/batch`](#post-reversebatch).
 
-```json
-{"title": "Unsupported parameter \"lat\""}
-```
+**La réponse** est le fichier, suivi de 15 colonnes : `result_latitude`, `result_longitude`, `result_label`, `result_distance` (en mètres entiers), `result_type`, `result_id`, `result_housenumber`, puis `result_name`, `result_postcode`, `result_city`, `result_context`, `result_citycode`, `result_oldcitycode`, `result_oldcity` et `result_district`. Comme pour `/search/csv`, la colonne `result_street`, toujours vide chez addok-csv, n'est pas écrite.
+
+- **Une ligne dont la position n'est pas faite de nombres** reste sans résultat, comme dans addok-csv.
+- **Une latitude hors de [-90, 90)** fait refuser le fichier avec une erreur 400 qui nomme sa ligne, là où addok-csv échoue sur toute la requête.
+- **Les filtres fonctionnent,** chaque ligne filtrée par la valeur de ses colonnes, alors qu'addok-csv 1.1.0 échoue dessus.
 
 ### `GET /search`
 
@@ -354,6 +392,7 @@ curl 'http://localhost:7878/search?q=8+rue+de+la+paix+par'
 | `autocomplete` | `1` : le dernier mot est pris pour le début d'un mot, comme pendant une saisie ; `0` (`false`, `no` et `off` valent aussi) pour une adresse complète. Une valeur vide vaut `1`, comme chez addok | `1` |
 | `limit` | Le nombre maximal de résultats, de 1 à 100 | `5` |
 | `type`, `citycode`, `postcode` | La valeur d'un [filtre](#filtrer-les-résultats) ; plusieurs valeurs séparées par des espaces, ou en répétant le paramètre | aucun filtre |
+| `lat`, `lon` | Le [point autour duquel chercher](#chercher-autour-dun-point), en degrés ; `latitude`, et `lng`, `long` ou `longitude`, valent aussi | aucun point |
 
 **La réponse** est une `FeatureCollection` GeoJSON, en `application/json; charset=utf-8` :
 
@@ -394,17 +433,32 @@ curl 'http://localhost:7878/search?q=8+rue+de+la+paix+par'
 
 - **Chaque résultat est un `Feature` :** sa position en longitude et latitude, puis ses propriétés : le libellé (`label`), le score non arrondi (`score`), et les champs du document de la BAN, coordonnées Lambert 93 (`x`, `y`) comprises. Un champ vide ou nul est omis, comme chez addok.
 - **Un numéro trouvé** ajoute `housenumber` et `street`, et son `name` commence par le numéro. Son `id` et sa position sont ceux du numéro.
-- **La réponse rappelle la requête :** `query`, `limit`, et `filters` quand des filtres sont passés.
-- **Les erreurs sont celles d'addok :** 400 sans `q` ou avec un `limit` qui n'est pas un entier de 1 à 100 (`0` vaut `5`, comme chez addok) ; 413 pour une requête de plus de 200 caractères.
+- **Avec un point,** chaque résultat a sa `distance` au point, en mètres entiers.
+- **La réponse rappelle la requête :** `query`, `limit`, `filters` quand des filtres sont passés, et `center`, longitude puis latitude, quand un point l'est, sauf une coordonnée nulle, comme chez addok.
+- **Les erreurs sont celles d'addok :** 400 sans `q`, avec un `limit` qui n'est pas un entier de 1 à 100 (`0` vaut `5`, comme chez addok), ou une coordonnée qui n'est pas un nombre ou sort de son domaine ; 413 pour une requête de plus de 200 caractères.
 - **Pour une adresse complète, passez `autocomplete=0`.** C'est l'appel que fait `/search/csv`, avec ses scores. Laissée active, comme par défaut chez addok, l'autocomplétion cherche aussi les mots que le dernier commence, et note autrement les libellés : 1 pour un libellé égal à la requête, 0,9 pour un libellé qui commence par elle, 0,7 pour un libellé qui la contient.
 
-#### Paramètres refusés par `GET /search`
 
-La recherche autour d'un point n'est pas encore portée. Plutôt que de répondre autrement qu'addok sans le dire, addok-rs refuse avec une erreur 400 une requête qui donne une position, `lat` ou `lon` (ou `latitude`, `lng`, `long`, `longitude`) :
+### `GET /reverse`
 
-```json
-{"title": "Unsupported parameter \"lat\""}
+`GET /reverse` est le géocodage inverse d'addok : les adresses les plus proches d'une position, au format GeoJSON de [`/search`](#get-search).
+
+```sh
+curl 'http://localhost:7878/reverse?lat=48.8686&lon=2.3317'
+curl 'http://localhost:7878/reverse?lat=48.8686&lon=2.3317&limit=3&type=housenumber'
 ```
+
+| Paramètre | Rôle | Par défaut |
+|---|---|---|
+| `lat`, `lon` | La position, en degrés (obligatoires) ; `latitude`, et `lng`, `long` ou `longitude`, valent aussi | — |
+| `limit` | Le nombre de résultats, sans plafond, comme chez addok | `1` |
+| `type`, `citycode`, `postcode` | La valeur d'un [filtre](#filtrer-les-résultats) | aucun filtre |
+| `nearest` | `1` pour l'[adresse la plus proche](#ladresse-la-plus-proche--nearest) dans le rayon (propre à addok-rs) | désactivé |
+| `radius` | Le rayon de `nearest`, en mètres, jusqu'à 10 000 | `5000` |
+
+- **Comme chez addok,** les candidats sont les adresses des environs immédiats de la position (environ 150 m alentour), et d'un cran plus loin s'il n'y en a aucune : au-delà, la réponse est vide. Chaque rue est représentée par celui de ses numéros le plus proche, ou par son propre point s'il est plus proche.
+- **Le score ne dépend que de la distance,** et chaque résultat a sa `distance` en mètres entiers.
+- **Les erreurs sont celles d'addok :** 400 sans `lon`, puis sans `lat`, avec une coordonnée qui n'est pas un nombre ou sort de son domaine, ou un `limit` qui n'est pas un entier.
 
 ### `GET /health`
 
@@ -413,7 +467,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.10.0"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.12.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -600,6 +654,34 @@ addok-cli batch ban.addok adresses.parquet geocodees.parquet \
 - **`type` décide du numéro.** Avec `housenumber` pour seule valeur, une ligne n'a de résultat que si son numéro est trouvé. Avec `street`, `locality` ou `municipality` seuls, le numéro de la requête est ignoré. Sans `type`, ou avec `housenumber` parmi d'autres valeurs, le numéro est cherché comme d'habitude.
 - **Un filtre est une contrainte stricte.** Il réduit ce que la recherche peut trouver : sous filtre, addok ne tente pas non plus de corriger les fautes de frappe d'une adresse dont d'autres mots sont trouvés. addok-rs fait de même. Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) garde lui aussi les filtres : avec un filtre `postcode`, il ne peut pas sortir de ce code postal.
 
+### Chercher autour d'un point
+
+Un point, `lat` et `lon` en degrés, favorise les adresses proches, comme dans addok : pour un nom de rue que portent cent communes, celle du point passe devant.
+
+```sh
+curl 'http://localhost:7878/search?q=rue+de+la+paix&lat=45.76&lon=4.83&limit=3'
+```
+
+- **La distance compte dans le score,** jusqu'à 0,1 au point même, et plus du tout au-delà de 100 km. La recherche ajoute aussi les adresses des environs immédiats du point (environ 150 m alentour), même quand les mots de la requête ne suffisent pas à les trouver : un numéro seul (`12`) trouve ainsi les numéros 12 les plus proches.
+- **Les scores changent d'échelle.** Avec un point, le score est divisé par 1,2 au lieu de 1,1. Une adresse à plus de 100 km du point a donc un score plus bas qu'elle n'aurait sans point. Un seuil de confiance réglé sans point n'est pas valable avec : mesurez-le sur vos propres données.
+- **Une coordonnée nulle ne compte pas pour les environs,** comme chez addok, qui la prend pour une absence ; la distance, elle, est toujours comptée.
+- **Sur un fichier,** `lat` et `lon` nomment deux colonnes, comme dans addok-csv : chaque ligne est cherchée autour de son propre point, et une ligne dont une des deux cellules est vide est cherchée sans point. Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) garde le point.
+- **Les erreurs d'un fichier sont refusées clairement** (erreur 400 qui nomme la ligne), là où addok-csv ignore les deux premières et échoue sur toute la requête pour la troisième : une seule des deux colonnes nommée, une colonne absente du fichier, une valeur qui n'est pas un nombre ou une latitude hors de [-90, 90).
+
+### L'adresse la plus proche : `nearest`
+
+Le géocodage inverse d'addok ne cherche qu'aux alentours immédiats de la position, à environ 150 m, puis un cran plus loin. Au-delà, il ne répond rien, même s'il y a une adresse à 400 m ; et quand l'adresse la plus proche se trouve juste hors de ces alentours, il en rend une plus lointaine. `nearest=1` (`--nearest on` en ligne de commande) cherche l'adresse **la plus proche dans un rayon donné**, 5 km par défaut :
+
+| Position | addok répond | dont pas l'adresse la plus proche | `nearest` répond |
+|---|---|---|---|
+| Sur une adresse, ou à 30 m ou 100 m | 100 % | 0 % | 100 %, les mêmes réponses |
+| À 300 m d'une adresse | 98,5 % | 3,6 % (35 m plus loin en moyenne) | 100 % |
+| À 1 km d'une adresse | 78,2 % | 4,2 % (43 m plus loin) | 100 % |
+| Au hasard en France métropolitaine (cadre englobant, mer comprise) | 32,2 % | 4,9 % (47 m plus loin) | 58,7 % |
+
+- **Là où addok trouve l'adresse la plus proche, `nearest` rend la même réponse.** Il n'en change que là où addok se trompe ou ne répond rien. Sur 300 positions, ses réponses ont été vérifiées contre toutes les 28,5 millions de positions de la BAN.
+- **Le coût vient du vide.** Près d'une adresse, `nearest` répond aussi vite que la recherche d'addok ; loin de toute adresse, il explore tout le rayon : environ 0,5 ms par position sans adresse à moins de 5 km, 2 ms pour 10 km.
+
 ### Code postal faux : le repli sur la commune
 
 Sur demande, un code postal faux ne fait plus perdre l'adresse. C'est le cas en particulier dans les villes à plusieurs codes postaux, quand le code saisi est celui de la ville mais d'un autre quartier. C'est la seule différence de géocodage voulue avec addok. Par exemple :
@@ -683,7 +765,7 @@ addok-rs est fait pour remplacer un addok qui géocode par lots avec `/search/cs
 2. **Lancez le serveur** sur le port 7878, comme addok ([section 5](#5-faire-tourner-le-serveur--addok-cli-serve)).
 3. **Pointez le client vers addok-rs.** `/search/csv` accepte les mêmes paramètres et rend les mêmes colonnes, dans le même ordre et au même format. Seule `result_street`, toujours vide chez addok-csv, disparaît. `/search` rend le même JSON qu'addok, autocomplétion comprise.
 4. **Recalibrez votre seuil de confiance.** addok-rs suit addok 1.3.2. Si vous veniez de l'image `etalab/addok` (addok 1.0.3, de 2022), les scores bougent  : trois ans de corrections amont séparent les deux (66 types de voie reconnus au lieu d'environ 38, libellés des communes fusionnées, règles phonétiques réécrites). Mesurez le seuil sur un échantillon vérifié de vos propres données.
-5. **Retirez les paramètres non portés.** `lat` et `lon` sont refusés avec une erreur 400, plutôt qu'ignorés en silence. Les filtres (`type`, `citycode`, `postcode`), eux, fonctionnent, alors qu'addok-csv 1.1.0 échouait dessus.
+5. **Vérifiez les paramètres.** `lat` et `lon` fonctionnent, mais une colonne absente ou une valeur illisible est refusée avec une erreur 400, là où addok-csv l'ignore ou échoue. Les filtres (`type`, `citycode`, `postcode`), eux, fonctionnent, alors qu'addok-csv 1.1.0 échouait dessus.
 6. **Retirez les contournements devenus inutiles :** le champ `delimiter` envoyé pour éviter un séparateur mal deviné, et le nettoyage des lignes trop longues fait pour ne pas perdre tout un fichier.
 7. **Une fois la bascule faite,** Redis et SQLite peuvent être arrêtés.
 
@@ -708,7 +790,8 @@ Ensuite, deux pas facultatifs :
 | `the CSV is not UTF-8` | CSV d'entrée dans un autre encodage (Windows-1252, par exemple) | Le convertir en UTF-8 |
 | 400 `Cannot found column 'adresse' in columns ['adresse,ville,code_postal']` | `/search/csv` : une colonne demandée n'existe pas dans le fichier, quel que soit le séparateur usuel essayé | Vérifier les noms de colonnes ; pour un séparateur inhabituel, l'indiquer avec le champ `delimiter` |
 | 400 `Cannot found column 'cp' in columns [...]`, ou `no column "cp"` | Un filtre nomme une colonne que le fichier n'a pas | Vérifier le nom de la colonne donnée au filtre |
-| 400 `Unsupported parameter "lat"` | Position non portée | Retirer le paramètre ([Limites actuelles](#13-limites-actuelles)) |
+| 400 `invalid number "abc" in column "lat", row 12` | La colonne d'un point contient autre chose qu'un nombre à cette ligne | Corriger la cellule, ou la vider pour chercher la ligne sans point |
+| 400 `"lat" names a column without "lon"` | Une seule des deux colonnes du point est nommée | Nommer les deux, ou aucune |
 | En-tête `X-Addok-Warning: query_too_long; …; rows=12`, ou `warning: 1 row longer than 200 characters left without a result: row 12` | Une ligne dépasse 200 caractères : elle reste sans résultat, les autres sont géocodées | Nettoyer la ligne indiquée, souvent du texte parasite (lorem ipsum, données de test) |
 | `/data/ban.addok: No such file or directory`, le conteneur s'arrête aussitôt | Pas d'index à la racine du dossier monté sur `/data`, ou sous un autre nom | Vérifier le chemin du volume et le nom du fichier ([Avec Docker](#avec-docker)) |
 | `Permission denied` en construisant l'index avec Docker | Le dossier monté n'est pas accessible en écriture à l'utilisateur du conteneur | Ajouter `--user "$(id -u):$(id -g)"` |
@@ -718,6 +801,6 @@ Ensuite, deux pas facultatifs :
 
 ## 13. Limites actuelles
 
-Ces fonctions d'addok ne sont pas encore portées : **la recherche autour d'un point** (`lat`, `lon`) et **le géocodage inverse** (`/reverse`, `/reverse/csv`).
+Toutes les fonctions d'addok qui servent à géocoder sont portées : recherche, autocomplétion, filtres, recherche autour d'un point et géocodage inverse.
 
 addok-rs ne géocode que les adresses françaises de la BAN : son pipeline est celui qu'addok utilise pour la France, écrit en dur.

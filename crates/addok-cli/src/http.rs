@@ -1,6 +1,6 @@
-//! The HTTP server: addok's `/search` and addok-csv's `/search/csv` over an
-//! index, `/batch`, Parquet or CSV in and out (see `batch`), and `/health`.
-//! Each request runs its rows in
+//! The HTTP server: addok's `/search` and `/reverse`, addok-csv's
+//! `/search/csv` and `/reverse/csv` over an index, `/batch`, Parquet or CSV
+//! in and out (see `batch`), and `/health`. Each request runs its rows in
 //! order on one thread, as many requests at once as the cores it is given:
 //! requests of consecutive rows keep their caches warm.
 //!
@@ -27,6 +27,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use addok_core::index::Index;
+use arrow::array::RecordBatch;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
@@ -34,8 +35,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use tokio::sync::Semaphore;
 
-use crate::batch::{self, Format, Options};
-use crate::geocoded::{FilterColumns, MIN_SCORE, Warning};
+use crate::batch::{self, Format, Options, ReverseOptions};
+use crate::geocoded::{FilterColumns, MIN_SCORE, PositionColumns, Warning, nearest_radius};
 use crate::search_csv::{self, Error, Request, flag};
 use crate::search_json;
 
@@ -61,8 +62,11 @@ where
     let app = Router::new()
         .route("/health", get(health::<B>))
         .route("/search", get(search::<B>))
+        .route("/reverse", get(reverse::<B>))
         .route("/search/csv", post(search_csv::<B>))
+        .route("/reverse/csv", post(reverse_csv::<B>))
         .route("/batch", post(batch::<B>))
+        .route("/reverse/batch", post(reverse_batch::<B>))
         // addok sets no limit on the file.
         .layer(DefaultBodyLimit::disable())
         .with_state(server);
@@ -95,15 +99,40 @@ async fn search<B>(State(server): State<Arc<Server<B>>>, Query(params): Query<Ve
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
+    let read = |params: &[(String, String)]| search_json::read(params).map(drop);
+    json(server, params, read, search_json::search_json).await
+}
+
+async fn reverse<B>(State(server): State<Arc<Server<B>>>, Query(params): Query<Vec<(String, String)>>) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    let read = |params: &[(String, String)]| search_json::read_reverse(params).map(drop);
+    json(server, params, read, search_json::reverse_json).await
+}
+
+/// What a JSON route answers to its parameters, on an index.
+type JsonAnswer<B> = fn(&Index<B>, &[(String, String)]) -> Result<serde_json::Value, search_json::Error>;
+
+/// A JSON route: its parameters read, then answered on a core.
+async fn json<B>(
+    server: Arc<Server<B>>,
+    params: Vec<(String, String)>,
+    read: impl Fn(&[(String, String)]) -> Result<(), search_json::Error>,
+    answer: JsonAnswer<B>,
+) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
     // Refused at once, as the other routes refuse their parameters: not
     // behind the geocoding that holds every core.
-    if let Err(refused) = search_json::read(&params) {
+    if let Err(refused) = read(&params) {
         return refusal(&refused);
     }
     let permit = server.permits.clone().acquire_owned().await.expect("never closed");
     let answer = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        search_json::search_json(&server.index, &params)
+        answer(&server.index, &params)
     });
     match answer.await {
         Ok(Ok(body)) => ([(header::CONTENT_TYPE, "application/json; charset=utf-8")], body.to_string()).into_response(),
@@ -112,13 +141,31 @@ where
     }
 }
 
-/// A `/search` request refused, as falcon writes it.
+/// A JSON request refused, as falcon writes it.
 fn refusal(refused: &search_json::Error) -> Response {
     let status = StatusCode::from_u16(refused.status).expect("an HTTP status");
     (status, [(header::CONTENT_TYPE, "application/json")], refused.body().to_string()).into_response()
 }
 
 async fn search_csv<B>(State(server): State<Arc<Server<B>>>, multipart: Multipart) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    csv(server, multipart, "/search/csv", search_csv::search_csv).await
+}
+
+async fn reverse_csv<B>(State(server): State<Arc<Server<B>>>, multipart: Multipart) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    csv(server, multipart, "/reverse/csv", search_csv::reverse_csv).await
+}
+
+/// What an addok-csv route answers to its request, on an index.
+type CsvAnswer<B> = fn(&Index<B>, &Request) -> Result<search_csv::Response, Error>;
+
+/// An addok-csv route: its form read, then answered on a core.
+async fn csv<B>(server: Arc<Server<B>>, multipart: Multipart, route: &'static str, answer: CsvAnswer<B>) -> Response
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
@@ -129,7 +176,7 @@ where
     let permit = server.permits.clone().acquire_owned().await.expect("never closed");
     let answer = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        search_csv::search_csv(&server.index, &request)
+        answer(&server.index, &request)
     });
     match answer.await {
         Ok(Ok(response)) => {
@@ -140,7 +187,7 @@ where
                 ],
                 response.body,
             );
-            warned(answered.into_response(), "/search/csv", &response.warnings)
+            warned(answered.into_response(), route, &response.warnings)
         }
         Ok(Err(Error::BadRequest(title))) => error(StatusCode::BAD_REQUEST, &title),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
@@ -151,11 +198,40 @@ async fn batch<B>(State(server): State<Arc<Server<B>>>, multipart: Multipart) ->
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
 {
+    table(server, multipart, "/batch", batch_options, batch::geocode_table).await
+}
+
+async fn reverse_batch<B>(State(server): State<Arc<Server<B>>>, multipart: Multipart) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    let reverse = |index: &Index<B>, table: &RecordBatch, options: &ReverseOptions| {
+        batch::reverse_table(index, table, options).map(|found| (found, Vec::new()))
+    };
+    table(server, multipart, "/reverse/batch", reverse_batch_options, reverse).await
+}
+
+/// A table route's formats and options, read from its request.
+type TableOptions<O> = fn(&Request) -> Result<(Format, Format, O), String>;
+
+/// A table route: its file and options read, the table worked on a core,
+/// written back in the format asked for.
+async fn table<B, O>(
+    server: Arc<Server<B>>,
+    multipart: Multipart,
+    route: &'static str,
+    options: TableOptions<O>,
+    work: impl Fn(&Index<B>, &RecordBatch, &O) -> Result<(RecordBatch, Vec<Warning>), batch::Error> + Send + 'static,
+) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+    O: Send + 'static,
+{
     let request = match form(multipart).await {
         Ok(request) => request,
         Err(title) => return error(StatusCode::BAD_REQUEST, &title),
     };
-    let (input, output, options) = match batch_options(&request) {
+    let (input, output, options) = match options(&request) {
         Ok(parsed) => parsed,
         Err(title) => return error(StatusCode::BAD_REQUEST, &title),
     };
@@ -164,7 +240,7 @@ where
     let answer = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let table = batch::read(request.data, input)?;
-        let (geocoded, warnings) = batch::geocode_table(&server.index, &table, &options)?;
+        let (geocoded, warnings) = work(&server.index, &table, &options)?;
         Ok((batch::write(&geocoded, output)?, warnings))
     });
     match answer.await {
@@ -178,7 +254,7 @@ where
                 ],
                 body,
             );
-            warned(answered.into_response(), "/batch", &warnings)
+            warned(answered.into_response(), route, &warnings)
         }
         Ok(Err(batch::Error(title))) => error(StatusCode::BAD_REQUEST, &title),
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
@@ -200,6 +276,48 @@ const WARNING: HeaderName = HeaderName::from_static("x-addok-warning");
 
 /// `/batch`'s formats and options, from its parameters.
 fn batch_options(request: &Request) -> Result<(Format, Format, Options), String> {
+    let param = |name: &str| request.params.get(name).and_then(|values| values.last());
+    let (input, output) = formats(request)?;
+    let min_score = match param("min_score") {
+        None => MIN_SCORE,
+        Some(value) => value.trim().parse().map_err(|_| format!("invalid \"min_score\": {value}"))?,
+    };
+    let postcode_fallback = match param("postcode_fallback") {
+        None => false,
+        Some(value) => flag(value).ok_or(format!("invalid \"postcode_fallback\": {value}"))?,
+    };
+    let columns = request.params.get("columns").cloned().unwrap_or_default();
+    let result_columns = request.params.get("result_columns").cloned().unwrap_or_default();
+    let filters = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
+    let position = PositionColumns::named(param("lat").map(String::as_str), param("lon").map(String::as_str))?;
+    let options = Options {
+        columns,
+        min_score,
+        threads: 1,
+        postcode_fallback,
+        result_columns,
+        filters,
+        position,
+    };
+    Ok((input, output, options))
+}
+
+/// `/reverse/batch`'s formats and options, from its parameters.
+fn reverse_batch_options(request: &Request) -> Result<(Format, Format, ReverseOptions), String> {
+    let param = |name: &str| request.params.get(name).and_then(|values| values.last()).map(String::as_str);
+    let (input, output) = formats(request)?;
+    let options = ReverseOptions {
+        position: PositionColumns::named(param("lat"), param("lon"))?,
+        threads: 1,
+        filters: FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice)),
+        nearest: nearest_radius(param)?,
+    };
+    Ok((input, output, options))
+}
+
+/// A table route's input and output formats, from its parameters: the
+/// file's extension unless named, the output the input's.
+fn formats(request: &Request) -> Result<(Format, Format), String> {
     let param = |name: &str| request.params.get(name).and_then(|values| values.last());
     let delimiter = |name: &str| match param(name) {
         None => Ok(batch::DELIMITER),
@@ -227,26 +345,7 @@ fn batch_options(request: &Request) -> Result<(Format, Format, Options), String>
             Format::Csv { .. } => Format::Csv { delimiter: output_delimiter },
         },
     };
-    let min_score = match param("min_score") {
-        None => MIN_SCORE,
-        Some(value) => value.trim().parse().map_err(|_| format!("invalid \"min_score\": {value}"))?,
-    };
-    let postcode_fallback = match param("postcode_fallback") {
-        None => false,
-        Some(value) => flag(value).ok_or(format!("invalid \"postcode_fallback\": {value}"))?,
-    };
-    let columns = request.params.get("columns").cloned().unwrap_or_default();
-    let result_columns = request.params.get("result_columns").cloned().unwrap_or_default();
-    let filters = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
-    let options = Options {
-        columns,
-        min_score,
-        threads: 1,
-        postcode_fallback,
-        result_columns,
-        filters,
-    };
-    Ok((input, output, options))
+    Ok((input, output))
 }
 
 /// addok-csv's `parse_multipart`: the first `data` part is the file, every
@@ -332,7 +431,7 @@ mod tests {
         let found = ask(&[("q", "abergement de var")]);
         assert_eq!(found.status(), StatusCode::OK);
         assert_eq!(found.headers()[header::CONTENT_TYPE], "application/json; charset=utf-8");
-        let refused = ask(&[("q", "abergement de varey"), ("lat", "46")]);
+        let refused = ask(&[("q", "abergement de varey"), ("limit", "abc")]);
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         assert_eq!(refused.headers()[header::CONTENT_TYPE], "application/json");
         let long = "a".repeat(201);
