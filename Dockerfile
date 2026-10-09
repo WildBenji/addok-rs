@@ -10,7 +10,7 @@
 #
 # The index is /data/ban.addok. Every argument after the image name is
 # appended to `serve`: `--cores N` caps the cores, which default to those the
-# container may use. See HOW-TO-USE.md § 4.
+# container may use. See HOW-TO-USE.md § 5.
 
 FROM rust:1-slim-trixie AS build
 WORKDIR /src
@@ -20,7 +20,7 @@ RUN cargo build --release --locked -p addok-cli
 
 FROM debian:trixie-slim
 LABEL org.opencontainers.image.source="https://github.com/WildBenji/addok-rs" \
-      org.opencontainers.image.description="Batch geocoding of French addresses against the BAN: addok rewritten in Rust" \
+      org.opencontainers.image.description="Geocoding of French addresses against the BAN: addok rewritten in Rust" \
       org.opencontainers.image.licenses="MIT"
 COPY --from=build /src/target/release/addok-cli /usr/local/bin/addok-cli
 RUN useradd --system --no-create-home addok

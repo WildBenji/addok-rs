@@ -5,9 +5,9 @@
 [![Licence MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 [![Image Docker](https://img.shields.io/badge/docker-ghcr.io%2Fwildbenji%2Faddok--rs-2496ED?logo=docker&logoColor=white)](https://github.com/WildBenji/addok-rs/pkgs/container/addok-rs)
 
-addok-rs fait une seule chose : redresser et géocoder des adresses françaises, par lots, à partir de la [Base Adresse Nationale](https://adresse.data.gouv.fr) (BAN). Il ne cherche pas à être un moteur générique comme addok. Il reprend exactement la combinaison qu'utilise la BAN, addok et ses extensions pour la France (addok-fr, addok-france, addok-csv), et la grave dans le code : même normalisation du texte, même phonétique, même classement, mêmes scores.
+addok-rs fait une seule chose : redresser et géocoder des adresses françaises, par fichiers entiers ou une à une, à partir de la [Base Adresse Nationale](https://adresse.data.gouv.fr) (BAN). Il ne cherche pas à être un moteur générique comme addok. Il reprend exactement la combinaison qu'utilise la BAN, addok et ses extensions pour la France (addok-fr, addok-france, addok-csv), et la grave dans le code : même normalisation du texte, même phonétique, même classement, mêmes scores.
 
-Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,94 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, numéro découpé).
+Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,94 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, numéro découpé, adresse la plus proche en géocodage inverse).
 
 ```sh
 docker run -d -p 7878:7878 -v "$PWD/index:/data:ro" ghcr.io/wildbenji/addok-rs
@@ -27,7 +27,7 @@ curl -F data=@adresses.csv -F columns=adresse -F columns=ville -F columns=code_p
 | **Géocodage d'un fichier Parquet** (100 000 lignes, lecture et écriture comprises) | impossible sans conversion en CSV | **44 745 adresses/s**, sans serveur |
 | **Index** | 5,2 Go dans Redis + 2,3 Go dans SQLite | **1,94 Go**, un seul fichier |
 | **Démarrage**, index prêt à répondre | 21 s à chaud, 102 s à froid | **moins d'une milliseconde** |
-| **Construction de l'index, France entière** | 21 min, plafonnée par Redis | **85 s**, sur un seul cœur |
+| **Construction de l'index, France entière** | 21 min, plafonnée par Redis | **90 s**, sur un seul cœur |
 | **À faire tourner** | gunicorn, ses workers Python, Redis et SQLite | **un seul binaire** |
 | **Réponses identiques à addok 1.3.2** (88 811 requêtes réelles) | — | **99,86 %**, chaque écart expliqué |
 
@@ -116,7 +116,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 
 - **Un seul binaire, un seul fichier d'index.** Il n'y a ni Redis ni SQLite à dimensionner, à superviser ou à sauvegarder.
 - **Un démarrage instantané :** l'index est projeté en mémoire, pas chargé.
-- **Une mise à jour de la BAN sans interruption.** Le nouvel index est construit à côté de l'ancien en 85 s, puis le remplace d'un coup. Le serveur continue de répondre pendant la construction, et son redémarrage est instantané.
+- **Une mise à jour de la BAN sans interruption.** Le nouvel index est construit à côté de l'ancien en 90 s, puis le remplace d'un coup. Le serveur continue de répondre pendant la construction, et son redémarrage est instantané.
 - **Une image Docker publique,** pour amd64 et arm64, qui ne contient que le binaire. L'index est monté de l'extérieur : une nouvelle édition de la BAN, c'est un nouveau fichier, pas une nouvelle image.
 - **`GET /health`** répond tout de suite, même sous charge, avec le nombre de documents de l'index chargé et la version.
 
@@ -141,7 +141,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 Chaque amélioration est désactivée par défaut, afin qu'addok-rs réponde comme addok tant qu'on ne demande rien d'autre. Chacune a été mesurée sur des adresses réelles.
 
 - **Le repli sur la commune quand le code postal est faux,** avec `postcode_fallback=1`. `4 RUE CLEMENT MAROT, PERPIGNAN, 66100` rend le 4 rue Clément Marot à Perpignan (66000), là où addok répond une autre rue sous le seuil. Sur 648 328 adresses réelles, il fait trouver plus de 2 000 adresses justes de plus, pour la même part de réponses justes.
-- **L'adresse la plus proche en géocodage inverse,** avec `nearest=1` : là où addok ne regarde qu'à 150 m alentour, elle cherche dans un rayon de 5 km. À 1 km d'une adresse, addok ne répond rien une fois sur cinq ; `nearest` répond toujours, et rend la même réponse qu'addok partout où la sienne est la plus proche.
+- **L'adresse la plus proche en géocodage inverse,** avec `nearest=1` : là où addok ne regarde qu'aux alentours immédiats (une centaine de mètres), elle cherche dans un rayon de 5 km. À 1 km d'une adresse, addok ne répond rien une fois sur cinq ; `nearest` répond toujours, et rend la même réponse qu'addok partout où la sienne est la plus proche.
 - **Le numéro découpé,** avec `result_columns` : `result_num` (`12`), `result_num_complement` tel que la BAN l'écrit (`bis`), et sa forme courte (`b`) pour rapprocher d'autres données.
 
 ---
@@ -208,7 +208,7 @@ Tout le reste est dans le **[guide d'utilisation](HOW-TO-USE.md)** : paramètres
 
 ## Limites
 
-addok-rs est un géocodeur **par lots, pour les adresses françaises de la BAN**, et l'assume :
+addok-rs est un géocodeur **pour les adresses françaises de la BAN**, pensé pour les lots, et l'assume :
 
 - **Ce n'est pas un géocodeur généraliste.** addok assemble son pipeline à partir de plugins déclarés dans sa configuration ; addok-rs écrit en dur la seule combinaison que la BAN utilise : phonétique et synonymes français, types de voie, compléments `bis` et `ter`, clavier AZERTY pour les fautes de frappe, schéma des documents de la BAN. Une seule combinaison, c'est ce qui permet de vérifier chaque réponse face à addok et de garder le code direct. Indexer une autre source ou un autre pays demanderait de changer le code, pas la configuration.
 - **Pas d'authentification,** comme addok : le serveur est fait pour un réseau interne.
@@ -219,11 +219,11 @@ addok-rs est un géocodeur **par lots, pour les adresses françaises de la BAN**
 
 ```
 crates/
-  addok-core/   le moteur, sans entrées-sorties : chaîne de texte, index, recherche
-  addok-cli/    la ligne de commande : build, serve, batch ; HTTP, CSV et Parquet
+  addok-core/   le moteur, sans entrées-sorties : chaîne de texte, index, recherche, géocodage inverse
+  addok-cli/    la ligne de commande : build, serve, batch, reverse ; HTTP, CSV et Parquet
 ```
 
-- **`addok-core`** ne fait aucune entrée-sortie. Il porte la chaîne de traitement du texte d'addok, l'index (un fichier de sections lu sur place, sans désérialisation) et la recherche.
+- **`addok-core`** ne fait aucune entrée-sortie. Il porte la chaîne de traitement du texte d'addok, l'index (un fichier de sections lu sur place, sans désérialisation, cellules géographiques comprises), la recherche et le géocodage inverse.
 - **`addok-cli`** y ajoute le serveur HTTP, une transcription du module `csv` de Python (pour reproduire addok-csv à l'octet près, défauts corrigés exceptés) et la lecture et l'écriture de Parquet.
 
 ---

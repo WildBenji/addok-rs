@@ -1,6 +1,6 @@
 [package]
 name = "addok-core"
-description = "addok-rs's engine: the index and the search, no I/O"
+description = "addok-rs's engine: the index, the search and reverse geocoding, no I/O"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

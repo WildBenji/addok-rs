@@ -1,7 +1,8 @@
 //! Geohashes as addok computes them with python-geohash 0.8.5: a position's
-//! cell, 7 characters long (addok's `GEOHASH_PRECISION`), about 150 m by
-//! 150 m in France, and the cells around one. Search around a point looks
-//! for documents in the cell of the point and its eight neighbours.
+//! cell, 7 characters long (addok's `GEOHASH_PRECISION`), about 150 m high
+//! and 105 m wide in France, and the cells around one. Search around a
+//! point looks for documents in the cell of the point and its eight
+//! neighbours; reverse geocoding, in those and the ring around them.
 
 /// addok's `GEOHASH_PRECISION`.
 pub const PRECISION: usize = 7;

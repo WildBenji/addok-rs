@@ -1,7 +1,7 @@
 //! The index: what addok-rs searches, built once per BAN release from the
-//! national NDJSON: its documents, and what addok's
-//! indexers write to Redis but the geohashes, which only searches around a
-//! point read. `write` builds it into a file of sections (see `format`),
+//! national NDJSON: its documents, and what addok's indexers write to
+//! Redis: tokens and their posting lists, pairs, edge ngrams, filters and
+//! geohash cells. `write` builds it into a file of sections (see `format`),
 //! which `Index` reads in place, memory-mapped.
 
 mod build;

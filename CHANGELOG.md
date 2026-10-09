@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.12.1 — 2026-10-09
+
+The documentation brought up to date with everything ported since v0.9.0. No change in behaviour, and no index rebuild.
+
+### Changed
+
+- **The guides** describe addok-rs as it now is: it answers one address at a time as well as whole files, builds its index in about 90 s, and offers `addok-cli reverse`, positions and the nearest address. The index-upgrade example shows the error an index from before v0.11.0 gives (`GeohashCells`), the migration steps cover `/reverse`, `/reverse/csv` and `nearest`, and the troubleshooting table lists the errors reverse geocoding added.
+- **The distance around a position** is stated as at least a hundred metres, not 150: a geohash cell is about 150 m high but only 105 m wide in France.
+- **Crate and image descriptions, the module headers, and the usage text of `addok-cli`** list reverse geocoding.
+- **The Dockerfile** points to the right section of the guide.
+
 ## v0.12.0 — 2026-10-09
 
 addok's reverse geocoding, at parity with addok 1.3.2, on every interface. With it every addok feature used for geocoding is ported: search, autocomplete, filters, search around a point and reverse. The index is unchanged: no rebuild.

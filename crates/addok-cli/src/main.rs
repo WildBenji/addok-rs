@@ -26,8 +26,8 @@ const USAGE: &str = "\
 usage:
   addok-cli build <ndjson[.gz]> <index>    index the BAN's NDJSON into a file
   addok-cli serve <index> [--host HOST] [--port PORT] [--cores N]
-                                           serve /search, /reverse, their /csv, /batch and
-                                           /reverse/batch (default 127.0.0.1:7878)
+                                           serve /search, /search/csv, /batch and their reverse
+                                           counterparts (default 127.0.0.1:7878)
   addok-cli batch <index> <input> <output> [options]
                                            geocode a Parquet or CSV file into another
     --columns A,B,C           the columns a row's query joins (default: all)
@@ -50,7 +50,7 @@ usage:
     --lat COL --lon COL       the position's columns (default: latitude or lat, then
                               longitude, lon, lng or long)
     --nearest on              the nearest address within the radius, where addok looks no
-                              further than about 150 m around (default: off)
+                              further than 100 to 200 m around (default: off)
     --radius M                the nearest's radius in metres, up to 10000 (default: 5000)
     --filters, --input-format, --output-format, --input-delimiter, --output-delimiter,
     --cores N                 as for batch
