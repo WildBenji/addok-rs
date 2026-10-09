@@ -148,6 +148,17 @@ impl Text {
             _ => &[],
         }
     }
+
+    /// The value addok's `Result` gives for the field: a list's first,
+    /// none if it is absent or null. Unlike `values().first()`, an empty
+    /// string is a value.
+    pub fn first(&self) -> Option<&str> {
+        match self {
+            Text::One(value) => Some(value),
+            Text::Many(values) => values.first().map(String::as_str),
+            Text::Absent | Text::Null => None,
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for Number {
@@ -230,6 +241,18 @@ fn housenumbers<'de, D: Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_field_s_first_value_as_addok() {
+        assert_eq!(Text::Absent.first(), None);
+        assert_eq!(Text::Null.first(), None);
+        assert_eq!(Text::One("Paris".into()).first(), Some("Paris"));
+        assert_eq!(Text::Many(vec!["75001".into(), "75002".into()]).first(), Some("75001"));
+        assert_eq!(Text::Many(Vec::new()).first(), None);
+        // An empty string is a value, which `values` leaves out.
+        assert_eq!(Text::One(String::new()).first(), Some(""));
+        assert_eq!(Text::One(String::new()).values().first(), None);
+    }
 
     #[test]
     fn reads_a_municipality_as_written() {

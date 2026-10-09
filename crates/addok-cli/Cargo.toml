@@ -1,6 +1,6 @@
 [package]
 name = "addok-cli"
-description = "addok-rs's command line: builds the index file, geocodes Parquet or CSV files, serves /batch, addok-csv's /search/csv and /health over it"
+description = "addok-rs's command line: builds the index file, geocodes Parquet or CSV files, serves /batch, addok's /search, addok-csv's /search/csv and /health over it"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-addok-core = { version = "0.8.0", path = "../addok-core" }
+addok-core = { version = "0.10.0", path = "../addok-core" }
 arrow = { version = "60.0.0", default-features = false }
 axum = { version = "0.8.9", features = ["multipart"] }
 bytes = "1.12.1"

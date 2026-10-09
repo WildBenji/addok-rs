@@ -79,12 +79,23 @@ const RESULT_HEADERS: [&str; 16] = [
     "result_district",
 ];
 
-/// A switch's value as addok-csv reads `with_bom`; none if it is neither.
+/// A switch's value by falcon's true and false strings; none if it is
+/// neither. A blank value is none here, where falcon reads it as true: see
+/// `param_flag`.
 pub fn flag(value: &str) -> Option<bool> {
     match value {
         "true" | "True" | "t" | "yes" | "y" | "1" | "on" => Some(true),
         "false" | "False" | "f" | "no" | "n" | "0" | "off" => Some(false),
         _ => None,
+    }
+}
+
+/// A switch's value as falcon's `get_param_as_bool` reads addok-csv's
+/// `with_bom` and addok's `autocomplete`: `flag`, a blank value true.
+pub fn param_flag(value: &str) -> Option<bool> {
+    match value.is_empty() {
+        true => Some(true),
+        false => flag(value),
     }
 }
 
@@ -123,7 +134,7 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
             Err(_) => return bad(format!("Invalid parameter \"min_score\": {value}")),
         },
     };
-    let with_bom = match param("with_bom").map(|value| flag(value).ok_or(value)) {
+    let with_bom = match param("with_bom").map(|value| param_flag(value).ok_or(value)) {
         None => false,
         Some(Ok(on)) => on,
         Some(Err(value)) => return bad(format!("Invalid parameter \"with_bom\": {value}")),
@@ -442,6 +453,33 @@ mod tests {
         assert_eq!(stem(".hidden"), ".hidden");
         assert_eq!(stem("dir.d/file"), "dir.d/file");
         assert_eq!(stem(""), "");
+    }
+
+    #[test]
+    fn reads_a_blank_with_bom_as_true_as_addok_csv() {
+        use addok_core::index::{AlignedBytes, write};
+        let mut bytes = AlignedBytes::default();
+        write(std::iter::empty(), &mut bytes).unwrap();
+        let index = Index::open(bytes).unwrap();
+        let answer = |with_bom: Option<&str>| {
+            let mut request = Request {
+                data: b"q\nparis\n".to_vec(),
+                filename: "a.csv".into(),
+                ..Request::default()
+            };
+            request.params.insert("encoding".into(), vec!["utf-8".into()]);
+            if let Some(value) = with_bom {
+                request.params.insert("with_bom".into(), vec![value.into()]);
+            }
+            search_csv(&index, &request).map(|response| response.body.starts_with("\u{feff}".as_bytes()))
+        };
+        // addok-csv 1.1.0 writes a byte-order mark for a blank `with_bom`, as
+        // falcon reads a blank flag; none without one.
+        assert_eq!(answer(Some("")), Ok(true));
+        assert_eq!(answer(Some("true")), Ok(true));
+        assert_eq!(answer(Some("off")), Ok(false));
+        assert_eq!(answer(None), Ok(false));
+        assert!(answer(Some("maybe")).is_err());
     }
 
     #[test]

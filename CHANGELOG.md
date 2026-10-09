@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.10.0 — 2026-10-09
+
+addok's autocomplete, at parity with addok 1.3.2: `/search` now answers as addok's does by default.
+
+### Features
+
+- **Autocomplete on `/search`, on by default as in addok:** the query's last word is taken as the start of one, as someone typing sends it (`8 rue de la paix par`). `autocomplete=0` turns it off, for a complete address and the scores `/search/csv` gives; a blank value turns it on, as in addok. A client written for addok no longer needs `autocomplete=0`.
+  - **Search:** `addok_core::search::search_autocomplete`, addok's `search(q, autocomplete=True)`, beside `search_filtered`. Labels are scored by the query they hold: 1 for a label that is the query, 0.9 for one that begins with it, 0.7 for one that contains it.
+  - **Measured:** on 90,108 requests over real addresses, autocomplete off, on, and on addresses cut short as typed, under limits 1 to 100 and several filters, every result both answers hold at the same rank is identical. The 2,134 requests where search itself diverges somewhere are all explained by the orders addok leaves to chance, among them the order addok tries autocomplete's words of equal frequency in.
+  - **Autocomplete off is unchanged:** the same answers as before on `/search/csv`, `/batch` and `addok-cli batch`, at the same throughput.
+
+### Changed
+
+- **`addok_core::search::search_traced`** takes the autocomplete switch.
+- **`addok_core::search::Order`** gains `candidates`, the order to try autocomplete's words of equal score in.
+- **`/search` no longer refuses requests without `autocomplete=0`;** `lat` and `lon` still are.
+
+## v0.9.0 — 2026-10-09
+
+addok's JSON `/search`, at parity with addok 1.3.2.
+
+### Features
+
+- **`GET /search`:** addok's JSON endpoint. One query in, its results out as addok's GeoJSON `FeatureCollection`, equal to addok's answer as JSON (its keys in another order). `limit` from 1 to 100, 5 by default; the filters `type`, `citycode` and `postcode` take values, several separated by spaces or with the parameter repeated.
+  - **Parameters are read as addok's HTTP layer reads them,** quirks included, and refused with its errors: 400 for a missing `q` or a `limit` out of range, 413 for a query over 200 characters.
+  - **Autocomplete must be turned off.** addok autocompletes by default, and autocomplete is not ported yet: a request without `autocomplete=0` is refused with a 400 that says so, rather than answered otherwise than addok would. `lat` and `lon`, and their aliases, are refused too.
+  - **A refused request is answered at once,** without waiting for a core busy geocoding.
+  - **Measured:** on 90,102 requests over real addresses, under limits 1, 5, 10, 50 and 100 and several filters, every result both answers hold at the same rank is identical, property by property. The 2,675 requests where search itself diverges, at any rank up to the 100th, are all explained by the orders addok leaves to chance.
+- **`addok_core::document::Text::first`:** a field's value as addok reads it, a list's first.
+
+### Fixed
+
+- **`/search/csv` reads a blank `with_bom` as true,** as addok-csv does, instead of refusing it.
+
+### Changed
+
+- **The Docker image workflow** uses the Node 24 releases of its actions.
+
 ## v0.8.0 — 2026-10-08
 
 addok's filters, at parity with addok 1.3.2, on every interface.

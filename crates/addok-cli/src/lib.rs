@@ -7,3 +7,4 @@ pub mod geocoded;
 pub mod http;
 pub mod pycsv;
 pub mod search_csv;
+pub mod search_json;

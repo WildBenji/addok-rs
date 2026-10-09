@@ -36,6 +36,7 @@ Quel que soit le mode, il faut d'abord [construire l'index](#3-construire-lindex
 |---|---|
 | Géocoder un fichier sur la machine où il se trouve | [`addok-cli batch`](#4-géocoder-un-fichier-en-local--addok-cli-batch) : ni réseau, ni découpage à gérer |
 | Offrir le géocodage à d'autres programmes ou d'autres machines | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`/batch`](#post-batch) |
+| Chercher une adresse à la fois depuis une application | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`GET /search`](#get-search) |
 | Remplacer un addok existant sans toucher à ses clients | [`addok-cli serve`](#5-faire-tourner-le-serveur--addok-cli-serve), avec [`/search/csv`](#post-searchcsv) (voir [Passer d'addok à addok-rs](#11-passer-daddok-à-addok-rs)) |
 
 ---
@@ -265,9 +266,10 @@ services:
 |---|---|
 | [`POST /batch`](#post-batch) | Géocode un fichier Parquet ou CSV et le rend en Parquet ou CSV. L'interface à privilégier. |
 | [`POST /search/csv`](#post-searchcsv) | Le point d'entrée d'addok-csv, à l'octet près, pour les clients d'addok existants. |
+| [`GET /search`](#get-search) | Le point d'entrée JSON d'addok : une adresse par requête, les résultats en GeoJSON. |
 | [`GET /health`](#get-health) | Dit si le serveur répond, avec l'index chargé et la version. |
 
-Les deux points d'entrée de géocodage reçoivent un formulaire `multipart/form-data` : le fichier dans le champ `data`, et chaque paramètre dans son propre champ. Seuls les champs du formulaire comptent : les paramètres passés dans l'URL sont ignorés, comme dans addok-csv.
+Les deux points d'entrée qui géocodent un fichier reçoivent un formulaire `multipart/form-data` : le fichier dans le champ `data`, et chaque paramètre dans son propre champ. Seuls les champs du formulaire comptent : les paramètres passés dans l'URL sont ignorés, comme dans addok-csv.
 
 ### `POST /batch`
 
@@ -334,6 +336,76 @@ Le géocodage autour d'un point (`lat`, `lon`) n'est pas encore porté. Plutôt 
 {"title": "Unsupported parameter \"lat\""}
 ```
 
+### `GET /search`
+
+`GET /search` est le point d'entrée JSON d'addok : une adresse par requête, ses résultats au format GeoJSON. Il donne les réponses d'addok 1.3.2, scores compris, dans le même JSON, à l'ordre des clés près.
+
+```sh
+# Une adresse complète
+curl 'http://localhost:7878/search?q=8+rue+de+la+paix+paris&autocomplete=0&limit=1'
+
+# Une adresse en cours de saisie : le dernier mot est complété
+curl 'http://localhost:7878/search?q=8+rue+de+la+paix+par'
+```
+
+| Paramètre | Rôle | Par défaut |
+|---|---|---|
+| `q` | L'adresse cherchée (obligatoire) | — |
+| `autocomplete` | `1` : le dernier mot est pris pour le début d'un mot, comme pendant une saisie ; `0` (`false`, `no` et `off` valent aussi) pour une adresse complète. Une valeur vide vaut `1`, comme chez addok | `1` |
+| `limit` | Le nombre maximal de résultats, de 1 à 100 | `5` |
+| `type`, `citycode`, `postcode` | La valeur d'un [filtre](#filtrer-les-résultats) ; plusieurs valeurs séparées par des espaces, ou en répétant le paramètre | aucun filtre |
+
+**La réponse** est une `FeatureCollection` GeoJSON, en `application/json; charset=utf-8` :
+
+```json
+{
+  "attribution": "BAN",
+  "features": [
+    {
+      "geometry": {"coordinates": [2.330992, 48.868831], "type": "Point"},
+      "properties": {
+        "banId": "36188683-f31c-4bce-85ad-17a842494e3e",
+        "city": "Paris",
+        "citycode": "75102",
+        "context": "75, Paris, Île-de-France",
+        "district": "Paris 2e Arrondissement",
+        "housenumber": "8",
+        "id": "75102_6998_00008",
+        "importance": 0.60466,
+        "label": "8 Rue de la Paix 75002 Paris",
+        "name": "8 Rue de la Paix",
+        "postcode": "75002",
+        "score": 0.9640599999999998,
+        "street": "Rue de la Paix",
+        "type": "housenumber",
+        "x": 650924.49,
+        "y": 6863408.22
+      },
+      "type": "Feature"
+    }
+  ],
+  "licence": "ETALAB-2.0",
+  "limit": 1,
+  "query": "8 rue de la paix paris",
+  "type": "FeatureCollection",
+  "version": "draft"
+}
+```
+
+- **Chaque résultat est un `Feature` :** sa position en longitude et latitude, puis ses propriétés : le libellé (`label`), le score non arrondi (`score`), et les champs du document de la BAN, coordonnées Lambert 93 (`x`, `y`) comprises. Un champ vide ou nul est omis, comme chez addok.
+- **Un numéro trouvé** ajoute `housenumber` et `street`, et son `name` commence par le numéro. Son `id` et sa position sont ceux du numéro.
+- **La réponse rappelle la requête :** `query`, `limit`, et `filters` quand des filtres sont passés.
+- **Les erreurs sont celles d'addok :** 400 sans `q` ou avec un `limit` qui n'est pas un entier de 1 à 100 (`0` vaut `5`, comme chez addok) ; 413 pour une requête de plus de 200 caractères.
+- **Pour une adresse complète, passez `autocomplete=0`.** C'est l'appel que fait `/search/csv`, avec ses scores. Laissée active, comme par défaut chez addok, l'autocomplétion cherche aussi les mots que le dernier commence, et note autrement les libellés : 1 pour un libellé égal à la requête, 0,9 pour un libellé qui commence par elle, 0,7 pour un libellé qui la contient.
+
+#### Paramètres refusés par `GET /search`
+
+La recherche autour d'un point n'est pas encore portée. Plutôt que de répondre autrement qu'addok sans le dire, addok-rs refuse avec une erreur 400 une requête qui donne une position, `lat` ou `lon` (ou `latitude`, `lng`, `long`, `longitude`) :
+
+```json
+{"title": "Unsupported parameter \"lat\""}
+```
+
 ### `GET /health`
 
 ```sh
@@ -341,7 +413,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.8.0"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.10.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -609,7 +681,7 @@ addok-rs est fait pour remplacer un addok qui géocode par lots avec `/search/cs
 
 1. **Construisez l'index** à partir de l'export NDJSON de la BAN ([section 3](#3-construire-lindex)). L'archive `addok.db` et `dump.rdb` d'addok ne sert pas.
 2. **Lancez le serveur** sur le port 7878, comme addok ([section 5](#5-faire-tourner-le-serveur--addok-cli-serve)).
-3. **Pointez le client vers addok-rs.** `/search/csv` accepte les mêmes paramètres et rend les mêmes colonnes, dans le même ordre et au même format. Seule `result_street`, toujours vide chez addok-csv, disparaît.
+3. **Pointez le client vers addok-rs.** `/search/csv` accepte les mêmes paramètres et rend les mêmes colonnes, dans le même ordre et au même format. Seule `result_street`, toujours vide chez addok-csv, disparaît. `/search` rend le même JSON qu'addok, autocomplétion comprise.
 4. **Recalibrez votre seuil de confiance.** addok-rs suit addok 1.3.2. Si vous veniez de l'image `etalab/addok` (addok 1.0.3, de 2022), les scores bougent  : trois ans de corrections amont séparent les deux (66 types de voie reconnus au lieu d'environ 38, libellés des communes fusionnées, règles phonétiques réécrites). Mesurez le seuil sur un échantillon vérifié de vos propres données.
 5. **Retirez les paramètres non portés.** `lat` et `lon` sont refusés avec une erreur 400, plutôt qu'ignorés en silence. Les filtres (`type`, `citycode`, `postcode`), eux, fonctionnent, alors qu'addok-csv 1.1.0 échouait dessus.
 6. **Retirez les contournements devenus inutiles :** le champ `delimiter` envoyé pour éviter un séparateur mal deviné, et le nettoyage des lignes trop longues fait pour ne pas perdre tout un fichier.
@@ -646,9 +718,6 @@ Ensuite, deux pas facultatifs :
 
 ## 13. Limites actuelles
 
-Ces fonctions d'addok ne sont pas encore portées :
-
-- **la recherche autour d'un point** (`lat`, `lon`) et **le géocodage inverse** (`/reverse`, `/reverse/csv`) ;
-- **le point d'entrée JSON** `/search`, et l'autocomplétion.
+Ces fonctions d'addok ne sont pas encore portées : **la recherche autour d'un point** (`lat`, `lon`) et **le géocodage inverse** (`/reverse`, `/reverse/csv`).
 
 addok-rs ne géocode que les adresses françaises de la BAN : son pipeline est celui qu'addok utilise pour la France, écrit en dur.

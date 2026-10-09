@@ -1,10 +1,10 @@
 //! Search: what addok answers to a query, ported from addok 1.3.2's `Search`
 //! (addok/core.py) with the preprocessors, collectors and result processors
-//! the BAN configures, and addok-france's labels. Only addok-csv's call is
-//! ported: autocomplete off, fuzzy on, filters but no position. Ported to
-//! answer as addok does, quirks included, but for ties: where addok's order
-//! follows Python's hash seed or Redis's, results rank by score, then by
-//! document number.
+//! the BAN configures, and addok-france's labels. Fuzzy on, autocomplete off
+//! as addok-csv calls it or on as addok's `/search` does by default,
+//! filters but no position. Ported to answer as addok does, quirks
+//! included, but for ties: where addok's order follows Python's hash seed
+//! or Redis's, results rank by score, then by document number.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -213,7 +213,21 @@ pub fn search_filtered<B: AsRef<[u8]>>(
     limit: usize,
     filters: &Filters,
 ) -> Result<Vec<Found>, QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit, filters)?;
+    let mut helper = Helper::new(index, query, limit, filters, false)?;
+    helper.collect();
+    Ok(helper.render())
+}
+
+/// `search_filtered`, the query's last word taken as the start of one:
+/// addok's `search(q, autocomplete=True, limit=limit, **filters)`, its
+/// `/search` by default.
+pub fn search_autocomplete<B: AsRef<[u8]>>(
+    index: &Index<B>,
+    query: &str,
+    limit: usize,
+    filters: &Filters,
+) -> Result<Vec<Found>, QueryTooLong> {
+    let mut helper = Helper::new(index, query, limit, filters, true)?;
     helper.collect();
     Ok(helper.render())
 }
@@ -233,8 +247,10 @@ pub struct Trace {
 /// The orders search sets where addok's follow its build or its
 /// hash seed: which of the documents tied at a cut it keeps
 /// (Redis keeps those its internal ids, numbered as the build goes, rank
-/// first), and in which order it groups tokens into relations (addok, in
-/// a Python set's). `search` keeps the default.
+/// first), in which order it groups tokens into relations (addok, in
+/// a Python set's), and in which order it tries the words of equal score
+/// that autocomplete finds (addok, in a Lua sort's, unstable, of a Redis
+/// set's). `search` keeps the default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Order {
     /// Keep the highest document numbers of a tie group, not the lowest.
@@ -243,17 +259,23 @@ pub struct Order {
     /// their words: the one addok's set took, say. Those it leaves out come
     /// after, by bytes; all of them when it is empty.
     pub tokens: Vec<String>,
+    /// The order to try autocomplete's words of equal score in, by their
+    /// words: the one addok's Lua sort returned, say. Those it leaves out
+    /// come after, by bytes; all of them when it is empty.
+    pub candidates: Vec<String>,
 }
 
-/// `search_filtered` in the order given, and its trace.
+/// `search_filtered`, or `search_autocomplete`, in the order given, and its
+/// trace.
 pub fn search_traced<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
     limit: usize,
     filters: &Filters,
+    autocomplete: bool,
     order: &Order,
 ) -> Result<(Vec<Found>, Trace), QueryTooLong> {
-    let mut helper = Helper::new(index, query, limit, filters)?;
+    let mut helper = Helper::new(index, query, limit, filters, autocomplete)?;
     helper.order = order.clone();
     helper.trace = Some(Tracing::default());
     helper.debug(|h| format!("Taken tokens: {}", tokens(&h.meaningful)));
@@ -366,6 +388,8 @@ struct Helper<'i, B> {
     /// have one: the `type` filter's say.
     check_housenumber: bool,
     only_housenumber: bool,
+    /// Whether the query's last word is taken as the start of one.
+    autocomplete: bool,
     order: Order,
     trace: Option<Tracing>,
 }
@@ -378,6 +402,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         query: &str,
         wanted: usize,
         filters: &Filters,
+        autocomplete: bool,
     ) -> Result<Self, QueryTooLong> {
         let query = text::fold(query);
         let processed = text::query_tokens(&query)?;
@@ -441,6 +466,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             filter: filters.documents(index).map(Rc::new),
             check_housenumber,
             only_housenumber,
+            autocomplete,
             order: Order::default(),
             trace: None,
         })
@@ -458,10 +484,9 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
     }
 
     /// addok's `RESULTS_COLLECTORS`, in order, until one says it is done;
-    /// less those that need a position or autocomplete, which addok-csv's
-    /// call never runs.
+    /// less those that need a position.
     fn collect(&mut self) {
-        let collectors: [Collector<'i, B>; 9] = [
+        let collectors: [Collector<'i, B>; 10] = [
             ("NO_AVAILABLE_TOKENS_ABORT", Self::no_available_tokens_abort),
             ("ONLY_COMMONS", Self::only_commons_collector),
             (
@@ -474,6 +499,10 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
             ),
             ("BUCKET_WITH_MEANINGFUL", Self::bucket_with_meaningful),
             ("REDUCE_WITH_OTHER_COMMONS", Self::reduce_with_other_commons),
+            (
+                "AUTOCOMPLETE_MEANINGFUL_COLLECTOR",
+                Self::autocomplete_meaningful,
+            ),
             ("FUZZY_COLLECTOR", Self::fuzzy),
             (
                 "EXTEND_RESULTS_EXTRAPOLING_RELATIONS",
@@ -664,35 +693,42 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         let (name, postcode, city) = (index.name(doc), index.postcode(doc), index.city(doc));
         let pieces = labels(&name, &postcode, &city, number, kind);
         let importance = index.importance(doc).map_or(0.0, Number::value) * IMPORTANCE_WEIGHT;
-        let mut str_distance = 0.0;
-        // A label folds as its pieces, each folded once, joined: folding
-        // turns every run of spaces and symbols into one space.
         let mut folded_pieces: Vec<(&str, String)> = Vec::new();
         let mut folded = String::new();
-        for label in &pieces {
-            folded.clear();
-            for &piece in label {
-                let i = match folded_pieces.iter().position(|&(raw, _)| raw == piece) {
-                    Some(i) => i,
-                    None => {
-                        folded_pieces.push((piece, text::fold(piece)));
-                        folded_pieces.len() - 1
-                    }
+        let mut str_distance = 0.0;
+        // addok's `score_by_autocomplete_distance`: the best of the labels
+        // the query is, begins or is in; the bigrams, scaled, if none.
+        let mut matched = false;
+        if self.autocomplete {
+            for label in &pieces {
+                fold_label(label, &mut folded_pieces, &mut folded);
+                let score = if folded == self.query {
+                    1.0
+                } else if folded.starts_with(self.query.as_str()) {
+                    0.9
+                } else if folded.contains(self.query.as_str()) {
+                    0.7
+                } else {
+                    continue;
                 };
-                let piece = &folded_pieces[i].1;
-                if !piece.is_empty() {
-                    if !folded.is_empty() {
-                        folded.push(' ');
-                    }
-                    folded.push_str(piece);
+                matched = true;
+                if score >= str_distance {
+                    str_distance = score;
                 }
             }
-            let score = compare_ngrams(&folded, &self.query, &mut self.bigrams);
-            if score >= str_distance {
-                str_distance = score;
-            }
-            if score >= MATCH_THRESHOLD {
-                break;
+        }
+        if !matched {
+            // addok's `score_by_ngram_distance`, or the autocomplete's own.
+            let scale = if self.autocomplete { 0.9 } else { 1.0 };
+            for label in &pieces {
+                fold_label(label, &mut folded_pieces, &mut folded);
+                let score = compare_ngrams(&folded, &self.query, &mut self.bigrams) * scale;
+                if score >= str_distance {
+                    str_distance = score;
+                }
+                if score >= MATCH_THRESHOLD {
+                    break;
+                }
             }
         }
         // addok sums its scores and their ceilings in this order.
@@ -846,6 +882,21 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         !self.bucket_empty()
     }
 
+    /// addok's `autocomplete_meaningful_collector`: the meaningful tokens
+    /// with each word the last one begins, unless the bucket overflows.
+    fn autocomplete_meaningful(&mut self) -> bool {
+        if self.bucket_overflow() {
+            return false;
+        }
+        if !self.autocomplete {
+            self.debug(|_| "Autocomplete not active. Abort.".to_owned());
+            return false;
+        }
+        let meaningful = self.meaningful.clone();
+        self.autocomplete(&meaningful, false);
+        false
+    }
+
     /// addok's `autocomplete`: the tokens the last one begins that share a
     /// document with every other, each tried with the others.
     fn autocomplete(&mut self, tokens: &[Token], skip_commons: bool) {
@@ -869,7 +920,7 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
         let list = |token: TokenId| index.postings(index.word(token));
         // addok's Lua scripts order them, by best score for one token, by
         // frequency otherwise, both descending; their sort is unstable, ours
-        // keeps byte order among equals.
+        // keeps byte order among equals, or the order given.
         let mut ordered: Vec<(TokenId, f64)> = candidates
             .into_iter()
             .map(|token| {
@@ -881,7 +932,12 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 (token, order)
             })
             .collect();
-        ordered.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let given = |token: TokenId| {
+            let word = index.word(token);
+            let at = self.order.candidates.iter().position(|candidate| candidate == word);
+            at.unwrap_or(usize::MAX)
+        };
+        ordered.sort_by(|a, b| b.1.total_cmp(&a.1).then(given(a.0).cmp(&given(b.0))));
         for (token, _) in ordered {
             let word = index.word(token);
             if skip_commons && list(token).map_or(0, |list| list.len()) > COMMON_THRESHOLD {
@@ -924,7 +980,8 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
                 self.new_bucket(&mut keys, 0);
             }
             self.keys = keys;
-            if self.has_cream() && self.cream() < BUCKET_MIN {
+            // Autocomplete computes before cream is checked.
+            if !self.autocomplete && self.has_cream() && self.cream() < BUCKET_MIN {
                 self.debug(|_| "Cream found. Returning.".to_owned());
                 return true;
             }
@@ -1286,6 +1343,29 @@ fn bigram(pair: &[u8]) -> usize {
     usize::from(pair[0]) << 7 | usize::from(pair[1])
 }
 
+/// A label folded into `folded`: its pieces, each folded once and kept in
+/// `pieces`, joined. Folding turns every run of spaces and symbols into one
+/// space, so the pieces fold as the whole would.
+fn fold_label<'p>(label: &[&'p str], pieces: &mut Vec<(&'p str, String)>, folded: &mut String) {
+    folded.clear();
+    for &piece in label {
+        let i = match pieces.iter().position(|&(raw, _)| raw == piece) {
+            Some(i) => i,
+            None => {
+                pieces.push((piece, text::fold(piece)));
+                pieces.len() - 1
+            }
+        };
+        let piece = &pieces[i].1;
+        if !piece.is_empty() {
+            if !folded.is_empty() {
+                folded.push(' ');
+            }
+            folded.push_str(piece);
+        }
+    }
+}
+
 /// addok's `compare_ngrams`: python-ngram's `NGram.compare` with N=2 and no
 /// padding, shared bigrams over all bigrams, counted with repetitions; but 1
 /// or 0 between single characters.
@@ -1503,6 +1583,47 @@ mod tests {
         Index::open(bytes).unwrap()
     }
 
+    #[test]
+    fn tries_autocomplete_s_words_of_equal_score_in_the_order_given() {
+        let street = |id: &str, city: &str| {
+            Document::from_ndjson(&format!(
+                r#"{{"id":"{id}","banId":null,"type":"street","name":"Rue Lima","postcode":"82000","citycode":"{}","city":"{city}","context":"","x":0,"y":0,"lon":1.3,"lat":44.0,"importance":0.5}}"#,
+                &id[..5]
+            ))
+            .unwrap()
+        };
+        let mut bytes = crate::index::AlignedBytes::default();
+        crate::index::write([street("82001_0001", "Montjoie"), street("82002_0001", "Montjoli")], &mut bytes).unwrap();
+        let index = Index::open(bytes).unwrap();
+        let tried = |candidates: &[&str]| {
+            let order = Order { candidates: candidates.iter().map(|&word| word.to_owned()).collect(), ..Order::default() };
+            let (_, trace) = search_traced(&index, "rue lima mon", 3, &Filters::default(), true, &order).unwrap();
+            let steps = trace.steps.iter().filter(|step| step.starts_with("Trying to extend bucket"));
+            steps.map(|step| step.rsplit('|').next().unwrap().to_owned()).collect::<Vec<_>>()
+        };
+        // Byte order by default; addok's Lua sort may have taken the other.
+        assert_eq!(tried(&[]), ["monjoi", "monjoli"]);
+        assert_eq!(tried(&["monjoli", "monjoi"]), ["monjoli", "monjoi"]);
+    }
+
+    #[test]
+    fn scores_labels_by_the_query_they_hold_when_autocompleting() {
+        let index = two_communes();
+        let distances = |query: &str, autocomplete: bool| {
+            let search = if autocomplete { search_autocomplete } else { search_filtered };
+            let found = search(&index, query, 3, &Filters::default()).unwrap();
+            found.iter().map(|found| (found.label().to_owned(), found.str_distance)).collect::<Vec<_>>()
+        };
+        // A label the query begins: 0.9; the query itself: 1; a label it is
+        // in: 0.7. None of them: the bigrams' score, times 0.9.
+        let lyo = distances("rue lima lyo", true);
+        assert_eq!(lyo[0], ("Rue Lima 69001 Lyon".to_owned(), 0.9));
+        let paris = distances("rue lima lyo", false)[1].1;
+        assert_eq!(lyo[1], ("Rue Lima 75001 Paris".to_owned(), paris * 0.9));
+        assert_eq!(distances("rue lima lyon", true)[0].1, 1.0);
+        assert_eq!(distances("lima lyon", true)[0], ("Rue Lima 69001 Lyon".to_owned(), 0.7));
+    }
+
     fn ids(found: &[Found]) -> Vec<&str> {
         found.iter().map(Found::id).collect()
     }
@@ -1573,7 +1694,7 @@ mod tests {
         // hundred: the order picks the two it drops.
         let index = index(&["Lima"; 102]);
         let ids = |order: &Order| {
-            let (found, trace) = search_traced(&index, "lima", 3, &Filters::default(), order).unwrap();
+            let (found, trace) = search_traced(&index, "lima", 3, &Filters::default(), false, order).unwrap();
             assert_eq!(trace.tied.len(), 102);
             let ids: Vec<String> = found.iter().map(|found| found.id().to_owned()).collect();
             ids
@@ -1592,7 +1713,7 @@ mod tests {
         // so a token joins the group of whichever neighbour comes first.
         let index = index(&["Lima Oslo", "Oslo Rome", "Rome Kiev", "Kiev Lima"]);
         let groups = |order: &Order| {
-            let (_, trace) = search_traced(&index, "lima oslo rome kiev", 3, &Filters::default(), order).unwrap();
+            let (_, trace) = search_traced(&index, "lima oslo rome kiev", 3, &Filters::default(), false, order).unwrap();
             let steps = trace.steps.into_iter();
             let keys = steps.filter_map(|step| {
                 let keys = step.strip_prefix("Adding to bucket with keys ");

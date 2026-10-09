@@ -25,7 +25,7 @@ const USAGE: &str = "\
 usage:
   addok-cli build <ndjson[.gz]> <index>    index the BAN's NDJSON into a file
   addok-cli serve <index> [--host HOST] [--port PORT] [--cores N]
-                                           serve /search/csv and /batch (default 127.0.0.1:7878)
+                                           serve /search, /search/csv and /batch (default 127.0.0.1:7878)
   addok-cli batch <index> <input> <output> [options]
                                            geocode a Parquet or CSV file into another
     --columns A,B,C           the columns a row's query joins (default: all)

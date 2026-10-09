@@ -123,9 +123,10 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 ### Interfaces
 
 - **`POST /search/csv` reproduit addok-csv à l'octet près,** moins ses trois défauts. Un client d'addok existant passe à addok-rs en changeant seulement l'URL.
+- **`GET /search` rend le GeoJSON d'addok,** pour une adresse à la fois, autocomplétion comprise.
 - **`POST /batch` prend du Parquet ou du CSV et rend du Parquet ou du CSV.** Les colonnes d'origine gardent leur type, et les résultats sont typés : scores et coordonnées en nombres, `null` en l'absence de résultat.
 - **`addok-cli batch` géocode un fichier entier sans serveur,** sur tous les cœurs.
-- **Les filtres d'addok** (`type`, `citycode`, `postcode`) sur les trois interfaces : chaque ligne est filtrée par la valeur de ses propres colonnes, ce qu'addok-csv 1.1.0 ne sait plus faire. Ils donnent les réponses d'addok 1.3.2 sous les mêmes filtres : 99,87 % de réponses identiques sur 540 226 recherches filtrées, chaque écart expliqué.
+- **Les filtres d'addok** (`type`, `citycode`, `postcode`) sur toutes les interfaces. Sur un fichier, chaque ligne est filtrée par la valeur de ses propres colonnes, ce qu'addok-csv 1.1.0 ne sait plus faire. Ils donnent les réponses d'addok 1.3.2 sous les mêmes filtres : 99,87 % de réponses identiques sur 540 226 recherches filtrées, chaque écart expliqué.
 - **Une ligne invalide n'est plus fatale.** Une adresse trop longue reste seule sans résultat, et un en-tête `X-Addok-Warning` dit laquelle.
 
 ### Des réponses reproductibles
@@ -161,6 +162,7 @@ Tout le reste est un **écart**, et chaque écart doit être expliqué. Deux ord
 
 - **Le deuxième résultat** est vérifié de la même façon. addok-csv en publie le score dans `result_score_next`, et là encore, chaque écart est expliqué.
 - **La sortie CSV** de `/search/csv` a été comparée octet par octet aux réponses d'addok-csv sur 100 requêtes de 1 000 lignes. Les seules différences qui ne viennent pas de la recherche sont deux des défauts corrigés.
+- **Le JSON** de `/search` a été comparé à celui d'addok sur 90 108 requêtes : les mêmes adresses, autocomplétion active et non, et en cours de saisie, sous les limites 1, 5, 10, 50 et 100 et sous plusieurs filtres, plus les cas limites des paramètres. Les 628 348 résultats que les deux donnent au même rang sont identiques, propriété par propriété. Sur 2 134 requêtes, la recherche diverge à un rang ou un autre : chaque écart est expliqué par les ordres qu'addok laisse au hasard.
 - **addok n'est pas toujours d'accord avec lui-même.** D'une graine de hachage ou d'une construction de l'index à l'autre, il change son meilleur résultat sur 80 de ces requêtes, et son deuxième sur 210 : aucune réimplémentation ne peut faire mieux que ce seuil.
 
 ---
@@ -205,9 +207,7 @@ Tout le reste est dans le **[guide d'utilisation](HOW-TO-USE.md)** : paramètres
 addok-rs est un géocodeur **par lots, pour les adresses françaises de la BAN**, et l'assume :
 
 - **Ce n'est pas un géocodeur généraliste.** addok assemble son pipeline à partir de plugins déclarés dans sa configuration ; addok-rs écrit en dur la seule combinaison que la BAN utilise : phonétique et synonymes français, types de voie, compléments `bis` et `ter`, clavier AZERTY pour les fautes de frappe, schéma des documents de la BAN. Une seule combinaison, c'est ce qui permet de vérifier chaque réponse face à addok et de garder le code direct. Indexer une autre source ou un autre pays demanderait de changer le code, pas la configuration.
-- **Ces fonctions d'addok ne sont pas encore portées** :
-  - la **recherche autour d'un point** (`lat`, `lon`) et le **géocodage inverse** ;
-  - le point d'entrée JSON `/search`, et l'autocomplétion.
+- **Ces fonctions d'addok ne sont pas encore portées :** la **recherche autour d'un point** (`lat`, `lon`) et le **géocodage inverse**.
 - **Pas d'authentification,** comme addok : le serveur est fait pour un réseau interne.
 
 ---

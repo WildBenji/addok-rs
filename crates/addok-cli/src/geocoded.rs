@@ -354,12 +354,7 @@ fn geocoded(best: &Found, next: Option<&Found>) -> Geocoded {
         Some(housenumber) => (Some(housenumber.lat), Some(housenumber.lon)),
         None => (document.lat, document.lon),
     };
-    // addok's `Result` attributes: a list's first value.
-    let text = |text: &Text| match text {
-        Text::One(value) => Some(value.clone()),
-        Text::Many(values) => values.first().cloned(),
-        Text::Null | Text::Absent => None,
-    };
+    let text = |text: &Text| text.first().map(str::to_owned);
     Geocoded {
         lat,
         lon,

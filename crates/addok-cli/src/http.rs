@@ -1,5 +1,6 @@
-//! The HTTP server: addok-csv's `/search/csv` over an index, `/batch`,
-//! Parquet or CSV in and out (see `batch`), and `/health`. Each request runs its rows in
+//! The HTTP server: addok's `/search` and addok-csv's `/search/csv` over an
+//! index, `/batch`, Parquet or CSV in and out (see `batch`), and `/health`.
+//! Each request runs its rows in
 //! order on one thread, as many requests at once as the cores it is given:
 //! requests of consecutive rows keep their caches warm.
 //!
@@ -27,7 +28,7 @@ use std::sync::Arc;
 
 use addok_core::index::Index;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -36,6 +37,7 @@ use tokio::sync::Semaphore;
 use crate::batch::{self, Format, Options};
 use crate::geocoded::{FilterColumns, MIN_SCORE, Warning};
 use crate::search_csv::{self, Error, Request, flag};
+use crate::search_json;
 
 struct Server<B> {
     index: Index<B>,
@@ -58,6 +60,7 @@ where
     });
     let app = Router::new()
         .route("/health", get(health::<B>))
+        .route("/search", get(search::<B>))
         .route("/search/csv", post(search_csv::<B>))
         .route("/batch", post(batch::<B>))
         // addok sets no limit on the file.
@@ -86,6 +89,33 @@ where
         "cores": server.cores,
     });
     ([(header::CONTENT_TYPE, "application/json")], body.to_string()).into_response()
+}
+
+async fn search<B>(State(server): State<Arc<Server<B>>>, Query(params): Query<Vec<(String, String)>>) -> Response
+where
+    B: AsRef<[u8]> + Send + Sync + 'static,
+{
+    // Refused at once, as the other routes refuse their parameters: not
+    // behind the geocoding that holds every core.
+    if let Err(refused) = search_json::read(&params) {
+        return refusal(&refused);
+    }
+    let permit = server.permits.clone().acquire_owned().await.expect("never closed");
+    let answer = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        search_json::search_json(&server.index, &params)
+    });
+    match answer.await {
+        Ok(Ok(body)) => ([(header::CONTENT_TYPE, "application/json; charset=utf-8")], body.to_string()).into_response(),
+        Ok(Err(refused)) => refusal(&refused),
+        Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
+    }
+}
+
+/// A `/search` request refused, as falcon writes it.
+fn refusal(refused: &search_json::Error) -> Response {
+    let status = StatusCode::from_u16(refused.status).expect("an HTTP status");
+    (status, [(header::CONTENT_TYPE, "application/json")], refused.body().to_string()).into_response()
 }
 
 async fn search_csv<B>(State(server): State<Arc<Server<B>>>, multipart: Multipart) -> Response
@@ -264,19 +294,23 @@ mod tests {
         assert_eq!(json["title"], title);
     }
 
-    #[test]
-    fn answers_health_with_its_index() {
+    /// A server of one municipality's index, on `cores` cores.
+    fn server(cores: usize) -> Arc<Server<addok_core::index::AlignedBytes>> {
         let line = r#"{"id":"01002","banId":null,"type":"municipality","name":"L'Abergement-de-Varey","postcode":["01640"],"citycode":"01002","lon":5.420189,"lat":46.008573,"city":"L'Abergement-de-Varey","importance":0.22554}"#;
         let document = addok_core::document::Document::from_ndjson(line).unwrap();
         let mut bytes = addok_core::index::AlignedBytes::default();
         addok_core::index::write([document], &mut bytes).unwrap();
-        let server = Arc::new(Server {
+        Arc::new(Server {
             index: Index::open(bytes).unwrap(),
-            cores: 3,
-            permits: Arc::new(Semaphore::new(3)),
-        });
+            cores,
+            permits: Arc::new(Semaphore::new(cores)),
+        })
+    }
+
+    #[test]
+    fn answers_health_with_its_index() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let response = runtime.block_on(health(State(server)));
+        let response = runtime.block_on(health(State(server(3))));
         assert_eq!(response.status(), StatusCode::OK);
         let body = runtime
             .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
@@ -285,6 +319,26 @@ mod tests {
         assert_eq!(json["status"], "HEALTHY");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!((json["documents"].as_u64(), json["cores"].as_u64()), (Some(1), Some(3)));
+    }
+
+    #[test]
+    fn answers_search_with_addok_s_statuses_and_content_types() {
+        let server = server(1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let ask = |pairs: &[(&str, &str)]| {
+            let params = pairs.iter().map(|&(key, value)| (key.to_owned(), value.to_owned())).collect();
+            runtime.block_on(search(State(server.clone()), Query(params)))
+        };
+        let found = ask(&[("q", "abergement de var")]);
+        assert_eq!(found.status(), StatusCode::OK);
+        assert_eq!(found.headers()[header::CONTENT_TYPE], "application/json; charset=utf-8");
+        let refused = ask(&[("q", "abergement de varey"), ("lat", "46")]);
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(refused.headers()[header::CONTENT_TYPE], "application/json");
+        let long = "a".repeat(201);
+        let too_long = ask(&[("q", &long), ("autocomplete", "0")]);
+        assert_eq!(too_long.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(too_long.headers()[header::CONTENT_TYPE], "application/json");
     }
 
     fn request(filename: &str, params: &[(&str, &str)]) -> Request {
