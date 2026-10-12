@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.13.0 — 2026-10-12
+
+The plain number when the BAN lacks the suffix, a third improvement, off by default. The index is unchanged: no rebuild.
+
+### Features
+
+- **`plain_number`** on `/search/csv` and `/batch`, `--plain-number on` on `addok-cli batch`. A query whose suffixed number the BAN lacks (`12 BIS` where the street has 12) gets the plain number rather than the street alone, at a median 20 m from the suffixed one where the street's point lies 90 m away. Only on a street of rounded score at least 0.62: below that it is mostly the wrong street. The score stays the street's, so no answer crosses a threshold because of it. On 7,680,737 real addresses it gives 40,131 street answers their number, 89% of them on the typed street, number and postcode by an approximate check. It costs about 5% of throughput. addok ignores the field: a client can send it to either engine.
+
 ## v0.12.1 — 2026-10-09
 
 The documentation brought up to date with everything ported since v0.9.0. No change in behaviour, and no index rebuild.

@@ -37,6 +37,8 @@ usage:
     --output-delimiter C      the output CSV's delimiter (default: ;)
     --min-score X             the rounded score a result must exceed (default: 0.5)
     --postcode-fallback on    search again without a wrong postcode (default: off)
+    --plain-number on         answer the plain number a street holds without the typed
+                              suffix: 12 for 12 BIS (default: off)
     --result-columns A,B      add the house number split: result_num, result_num_complement,
                               result_num_complement_short (default: none)
     --filters F=COL,F=COL     keep the results each row's value in COL allows, for each
@@ -155,6 +157,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
     let (mut input_delimiter, mut output_delimiter) = (batch::DELIMITER, batch::DELIMITER);
     let mut min_score = MIN_SCORE;
     let mut postcode_fallback = false;
+    let mut plain_number = false;
     let mut filters = FilterColumns::default();
     let (mut lat, mut lon) = (None, None);
     let mut cores = available_cores();
@@ -168,6 +171,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
             ["--output-delimiter", value] => output_delimiter = one(value)?,
             ["--min-score", value] => min_score = value.parse().map_err(|_| USAGE.to_owned())?,
             ["--postcode-fallback", value] => postcode_fallback = flag(value).ok_or(USAGE.to_owned())?,
+            ["--plain-number", value] => plain_number = flag(value).ok_or(USAGE.to_owned())?,
             ["--filters", value] => filters = filter_columns(value)?,
             ["--lat", value] => lat = Some(value),
             ["--lon", value] => lon = Some(value),
@@ -186,6 +190,7 @@ fn batch_file(index: &str, input: &str, output: &str, options: &[&str]) -> Resul
         min_score,
         threads: cores,
         postcode_fallback,
+        plain_number,
         result_columns,
         filters,
         position: PositionColumns::named(lat, lon).map_err(|_| "--lat and --lon go together".to_owned())?,

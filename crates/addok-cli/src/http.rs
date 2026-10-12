@@ -286,6 +286,10 @@ fn batch_options(request: &Request) -> Result<(Format, Format, Options), String>
         None => false,
         Some(value) => flag(value).ok_or(format!("invalid \"postcode_fallback\": {value}"))?,
     };
+    let plain_number = match param("plain_number") {
+        None => false,
+        Some(value) => flag(value).ok_or(format!("invalid \"plain_number\": {value}"))?,
+    };
     let columns = request.params.get("columns").cloned().unwrap_or_default();
     let result_columns = request.params.get("result_columns").cloned().unwrap_or_default();
     let filters = FilterColumns::named(|name| request.params.get(name).map(Vec::as_slice));
@@ -295,6 +299,7 @@ fn batch_options(request: &Request) -> Result<(Format, Format, Options), String>
         min_score,
         threads: 1,
         postcode_fallback,
+        plain_number,
         result_columns,
         filters,
         position,
@@ -457,6 +462,7 @@ mod tests {
         assert_eq!((input, output), (Format::Parquet, Format::Parquet));
         assert_eq!((options.min_score, options.threads), (MIN_SCORE, 1));
         assert!(!options.postcode_fallback);
+        assert!(!options.plain_number);
         assert!(options.columns.is_empty() && options.result_columns.is_empty());
         // The output follows the input, with its own delimiter.
         let (input, output, _) =
@@ -470,6 +476,7 @@ mod tests {
             ("columns", "city"),
             ("min_score", "0.7"),
             ("postcode_fallback", "1"),
+            ("plain_number", "on"),
             ("result_columns", "result_label"),
             ("result_columns", "result_num"),
         ];
@@ -478,11 +485,13 @@ mod tests {
         assert_eq!(options.columns, ["ad3", "city"]);
         assert_eq!(options.min_score, 0.7);
         assert!(options.postcode_fallback);
+        assert!(options.plain_number);
         assert_eq!(options.result_columns, ["result_label", "result_num"]);
         // Nothing names the format; delimiters are one character.
         assert!(batch_options(&request("addresses", &[])).is_err());
         assert!(batch_options(&request("a.csv", &[("input_delimiter", ";;")])).is_err());
         assert!(batch_options(&request("a.csv", &[("min_score", "high")])).is_err());
         assert!(batch_options(&request("a.csv", &[("postcode_fallback", "maybe")])).is_err());
+        assert!(batch_options(&request("a.csv", &[("plain_number", "maybe")])).is_err());
     }
 }

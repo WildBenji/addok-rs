@@ -168,6 +168,7 @@ Le fichier de sortie reprend **toutes les lignes et toutes les colonnes** du fic
 | `--output-delimiter C` | Séparateur du CSV de sortie, un caractère | `;` |
 | `--min-score X` | Score arrondi qu'un résultat doit dépasser pour être retenu | `0.5` |
 | `--postcode-fallback on` | Le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) quand le code postal est faux | désactivé |
+| `--plain-number on` | Le [numéro sans complément](#numéro-sans-complément--plain_number) : `12` pour `12 BIS` quand la BAN n'a pas le 12 bis | désactivé |
 | `--result-columns A,B` | Ajoute le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) : `result_num`, `result_num_complement`, `result_num_complement_short` | aucune |
 | `--filters F=COL,F=COL` | [Filtre](#filtrer-les-résultats) chaque ligne par la valeur de la colonne `COL`, pour chaque filtre `F` : `type`, `citycode` ou `postcode` | aucun |
 | `--lat COL --lon COL` | [Cherche chaque ligne autour du point](#chercher-autour-dun-point) que donnent ces deux colonnes | aucun point |
@@ -306,6 +307,7 @@ Les points d'entrée qui reçoivent un fichier reçoivent un formulaire `multipa
 | `output_delimiter` | Séparateur du CSV de sortie | `;` |
 | `min_score` | Score arrondi qu'un résultat doit dépasser | `0.5` |
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (`true`, `on` et `yes` valent aussi) | désactivé |
+| `plain_number` | `1` pour le [numéro sans complément](#numéro-sans-complément--plain_number) (`true`, `on` et `yes` valent aussi) | désactivé |
 | `result_columns` | Une colonne de résultat en plus ; répéter le champ pour chacune : `result_num`, `result_num_complement`, `result_num_complement_short` ([numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte)). Les autres noms sont ignorés | aucune |
 | `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne | aucun filtre |
 | `lat`, `lon` | Le nom des colonnes du [point autour duquel chercher](#chercher-autour-dun-point) chaque ligne | aucun point |
@@ -342,6 +344,7 @@ Les points d'entrée qui reçoivent un fichier reçoivent un formulaire `multipa
 | `min_score` | Score arrondi qu'un résultat doit dépasser | `0.5` |
 | `with_bom` | `true` pour ajouter une marque d'ordre d'octets en tête de réponse | `false` |
 | `postcode_fallback` | `1` pour le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune) (propre à addok-rs) | désactivé |
+| `plain_number` | `1` pour le [numéro sans complément](#numéro-sans-complément--plain_number) (propre à addok-rs) | désactivé |
 | `result_columns` | Comme dans `/batch` : seuls `result_num`, `result_num_complement` et `result_num_complement_short` ajoutent une colonne, après les 16 d'addok-csv (propre à addok-rs). Les autres noms ne changent rien, comme dans addok-csv | aucune |
 | `type`, `citycode`, `postcode` | Le nom d'une colonne dont la valeur [filtre](#filtrer-les-résultats) chaque ligne, comme dans addok-csv | aucun filtre |
 | `lat`, `lon` | Le nom des colonnes du [point autour duquel chercher](#chercher-autour-dun-point) chaque ligne, comme dans addok-csv | aucun point |
@@ -466,7 +469,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.12.1"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.13.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -683,7 +686,7 @@ Le géocodage inverse d'addok ne cherche qu'aux alentours immédiats de la posit
 
 ### Code postal faux : le repli sur la commune
 
-Sur demande, un code postal faux ne fait plus perdre l'adresse. C'est le cas en particulier dans les villes à plusieurs codes postaux, quand le code saisi est celui de la ville mais d'un autre quartier. C'est la seule différence de géocodage voulue avec addok. Par exemple :
+Sur demande, un code postal faux ne fait plus perdre l'adresse. C'est le cas en particulier dans les villes à plusieurs codes postaux, quand le code saisi est celui de la ville mais d'un autre quartier. Avec le [numéro sans complément](#numéro-sans-complément--plain_number), c'est l'une des deux différences de recherche voulues avec addok. Par exemple :
 
 > `4 RUE CLEMENT MAROT, PERPIGNAN, 66100` rend `4 Rue Clément Marot 66000 Perpignan`.
 
@@ -698,6 +701,23 @@ Sur demande, un code postal faux ne fait plus perdre l'adresse. C'est le cas en 
 - **Sinon,** la première réponse reste.
 - **Le score rendu** est alors celui de la requête sans code postal.
 - **Ce qui ne change pas :** une réponse déjà sûre n'est jamais cherchée deux fois, et son score reste celui d'addok.
+
+### Numéro sans complément : `plain_number`
+
+Sur demande, un numéro dont la BAN n'a pas le complément rend le numéro simple de la même voie, plutôt que la voie seule. Par exemple :
+
+> `12 BIS RUE DE LA PAIX, PARIS`, quand la BAN a le 12 mais pas le 12 bis, rend `12 Rue de la Paix 75002 Paris` au lieu de `Rue de la Paix 75002 Paris`.
+
+- **Pour l'activer :** il est désactivé par défaut, et addok-rs répond alors comme addok.
+  - Avec `/search/csv` ou `/batch`, ajoutez le champ `plain_number=1` : `curl … -F plain_number=1 …`. addok ignore ce champ, on peut donc l'envoyer aux deux moteurs.
+  - Avec `addok-cli batch`, passez `--plain-number on`.
+  - Il coûte environ 5 % de débit : 48 000 lignes/s au lieu de 50 700, mesuré sur 7,68 millions d'adresses réelles.
+- **Quand il s'applique :** le meilleur résultat d'une ligne est une voie de score au moins 0,62, le numéro de la requête porte un complément (`12 BIS`, `4B`), et la voie a ce numéro sans complément. Avec le repli sur la commune, il s'applique après lui.
+- **Quand il ne s'applique pas :** sous 0,62, la voie trouvée est le plus souvent une autre que celle saisie. Elle reste une voie plutôt que de recevoir un numéro.
+- **Ce qu'il rend :** le numéro simple, avec `result_type` à `housenumber`, sa position et son identifiant. Dans la BAN, le numéro simple est à une vingtaine de mètres du numéro avec complément (médiane), là où le point de la voie en est à 90 m.
+- **Le numéro rendu n'est pas celui saisi :** `result_housenumber` vaut `12` pour `12 BIS`. Pour repérer ces lignes, comparez-le au numéro de la ligne.
+- **Ce qui ne change pas :** le score reste celui de la voie, si bien qu'aucune ligne ne passe un seuil grâce à lui. Le classement ne change pas non plus.
+- **Ce qu'il apporte :** sur 7,68 millions d'adresses réelles, 40 131 réponses qui n'avaient que la voie reçoivent un numéro, dont au moins 89 % sur la voie, au numéro et au code postal saisis.
 
 ---
 
@@ -771,7 +791,7 @@ addok-rs est fait pour remplacer un addok qui géocode par lots avec `/search/cs
 Ensuite, deux pas facultatifs :
 
 - **Passer à `/batch`** pour échanger du Parquet typé plutôt que du CSV ([section 6](#post-batch)).
-- **Activer les améliorations** : le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune), le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) et l'[adresse la plus proche](#ladresse-la-plus-proche--nearest). addok ignore les champs `postcode_fallback`, `result_columns`, `nearest` et `radius`, ce qui permet de les envoyer aux deux moteurs pendant la transition.
+- **Activer les améliorations** : le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune), le [numéro sans complément](#numéro-sans-complément--plain_number), le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) et l'[adresse la plus proche](#ladresse-la-plus-proche--nearest). addok ignore les champs `postcode_fallback`, `plain_number`, `result_columns`, `nearest` et `radius`, ce qui permet de les envoyer aux deux moteurs pendant la transition.
 
 ---
 

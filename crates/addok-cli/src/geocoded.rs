@@ -12,7 +12,8 @@ use crate::search_csv::flag;
 pub const MIN_SCORE: f64 = 0.5;
 
 /// The rounded score at which a house number is trusted, the postcode
-/// fallback's bar, measured on 648,328 real addresses on 2026-10-06.
+/// fallback's bar, measured on 648,328 real addresses on 2026-10-06, and
+/// the plain number's.
 pub const CONFIDENT_SCORE: f64 = 0.62;
 
 /// What a request's geocoding left undone, reported beside its answer rather
@@ -241,8 +242,8 @@ pub fn split_housenumber(housenumber: &str) -> [Option<String>; 3] {
 
 /// addok-csv's `process_row`: the query's best result among the documents
 /// the filters hold, around the row's position if it has one, unless its
-/// rounded score is not above `min_score`. With `postcode_fallback`, asked
-/// for, the one departure from it.
+/// rounded score is not above `min_score`. With `postcode_fallback` and
+/// `plain_number`, asked for, the departures from it.
 pub fn geocode<B: AsRef<[u8]>>(
     index: &Index<B>,
     query: &str,
@@ -250,11 +251,22 @@ pub fn geocode<B: AsRef<[u8]>>(
     center: Option<Center>,
     min_score: f64,
     postcode_fallback: bool,
+    plain_number: bool,
 ) -> Result<Option<Geocoded>, QueryTooLong> {
     let options = Options { limit: 3, autocomplete: false, filters: filters.clone(), center };
     let mut found = search_with(index, query, &options)?;
     if postcode_fallback && let Some(rescued) = self::postcode_fallback(index, query, &options, &found)? {
         found = rescued;
+    }
+    // After the postcode fallback, whose rescue is a house number: the
+    // plain number never keeps it from searching again. Only on a street
+    // trusted as one: below the bar, it is mostly the wrong street.
+    if plain_number
+        && let Some(best) = found.first()
+        && round(best.score) >= CONFIDENT_SCORE
+        && let Some(plain) = addok_core::search::plain_number(index, query, filters, best)?
+    {
+        found[0] = plain;
     }
     let best = found.first().filter(|best| round(best.score) > min_score);
     Ok(best.map(|best| geocoded(best, found.get(1))))
@@ -587,6 +599,26 @@ mod tests {
         assert_eq!(rescued[0].label(), "4 Rue Clément Marot 66000 Perpignan");
         // Not in a commune the query names: the first answer stands.
         assert!(postcode_fallback(&index, "4 RUE CLEMENT MAROT CANET 66140", &three(), &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn answers_the_plain_number_only_when_asked() {
+        let index = perpignan();
+        let geocode = |query, plain_number| {
+            geocode(&index, query, &Filters::default(), None, MIN_SCORE, false, plain_number).unwrap().unwrap()
+        };
+        let street = geocode("4 BIS RUE CLEMENT MAROT PERPIGNAN", false);
+        assert_eq!((street.kind.as_str(), street.housenumber), ("street", None));
+        let four = geocode("4 BIS RUE CLEMENT MAROT PERPIGNAN", true);
+        assert_eq!(four.kind, "housenumber");
+        assert_eq!(four.housenumber.as_deref(), Some("4"));
+        assert_eq!(four.label, "4 Rue Clément Marot 66000 Perpignan");
+        assert_eq!(four.id, "66136_0001_00004");
+        assert_eq!(four.score, street.score);
+        // Below the bar, a street is too often the wrong one to be given a
+        // number.
+        let weak = geocode("4 BIS RUE CLEMENT PERPIGNAN", true);
+        assert_eq!((weak.kind.as_str(), weak.score), ("street", 0.61));
     }
 
     #[test]

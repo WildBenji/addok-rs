@@ -85,6 +85,9 @@ pub struct Options {
     pub threads: usize,
     /// Whether to search again without a wrong postcode.
     pub postcode_fallback: bool,
+    /// Whether to answer the plain number a street holds without the
+    /// typed suffix.
+    pub plain_number: bool,
     /// The result columns asked for besides the default ones: those of
     /// `SPLIT_COLUMNS` named here are added, other names ignored.
     pub result_columns: Vec<String>,
@@ -225,7 +228,7 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
     };
 
     let geocoded = in_blocks(table.num_rows(), options.threads, |row| {
-        geocode(index, &query(row), &filters(row), centers[row], options.min_score, options.postcode_fallback)
+        geocode(index, &query(row), &filters(row), centers[row], options.min_score, options.postcode_fallback, options.plain_number)
     });
     let too_long: Vec<usize> = (1..).zip(&geocoded).filter(|(_, geocoded)| geocoded.is_err()).map(|(row, _)| row).collect();
     let rows: Vec<Option<Geocoded>> = geocoded.into_iter().map(|geocoded| geocoded.ok().flatten()).collect();
@@ -512,6 +515,7 @@ mod tests {
             min_score: 0.5,
             threads: 2,
             postcode_fallback: false,
+            plain_number: false,
             result_columns: Vec::new(),
             filters: FilterColumns::default(),
             position: None,

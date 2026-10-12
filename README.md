@@ -141,6 +141,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 Chaque amélioration est désactivée par défaut, afin qu'addok-rs réponde comme addok tant qu'on ne demande rien d'autre. Chacune a été mesurée sur des adresses réelles.
 
 - **Le repli sur la commune quand le code postal est faux,** avec `postcode_fallback=1`. `4 RUE CLEMENT MAROT, PERPIGNAN, 66100` rend le 4 rue Clément Marot à Perpignan (66000), là où addok répond une autre rue sous le seuil. Sur 648 328 adresses réelles, il fait trouver plus de 2 000 adresses justes de plus, pour la même part de réponses justes.
+- **Le numéro sans complément quand la BAN ne l'a pas,** avec `plain_number=1`. `12 BIS RUE DE LA PAIX, PARIS` rend le 12 rue de la Paix quand la BAN n'a pas le 12 bis, là où addok ne rend que la voie. Le numéro simple est à une vingtaine de mètres du numéro saisi, le point de la voie à 90 m. Sur 7,68 millions d'adresses réelles, 40 000 réponses gagnent ainsi leur numéro, sans qu'aucun score change.
 - **L'adresse la plus proche en géocodage inverse,** avec `nearest=1` : là où addok ne regarde qu'aux alentours immédiats (une centaine de mètres), elle cherche dans un rayon de 5 km. À 1 km d'une adresse, addok ne répond rien une fois sur cinq ; `nearest` répond toujours, et rend la même réponse qu'addok partout où la sienne est la plus proche.
 - **Le numéro découpé,** avec `result_columns` : `result_num` (`12`), `result_num_complement` tel que la BAN l'écrit (`bis`), et sa forme courte (`b`) pour rapprocher d'autres données.
 

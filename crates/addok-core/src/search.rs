@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::document::{Document, HouseNumber, Number, TextRef};
 use crate::geohash;
-use crate::index::{Index, TokenId};
+use crate::index::{Index, TokenId, housenumber_token};
 use crate::postings::{self, DocId, PostingList};
 use crate::text::{self, QueryTooLong};
 
@@ -274,6 +274,46 @@ pub fn search_with<B: AsRef<[u8]>>(
     let mut helper = Helper::new(index, query, options)?;
     helper.collect();
     Ok(helper.render())
+}
+
+/// The plain number, asked for apart from addok: a result that did not
+/// match the query's house number because the BAN holds it only without
+/// its suffix (`4 bis` where the street has 4) made that plain number,
+/// its scores and distance the street's. None when the result matched a
+/// number, the query's has no suffix, the street lacks the plain one, or
+/// the filters leave house numbers aside.
+pub fn plain_number<B: AsRef<[u8]>>(
+    index: &Index<B>,
+    query: &str,
+    filters: &Filters,
+    found: &Found,
+) -> Result<Option<Found>, QueryTooLong> {
+    if found.housenumber.is_some() || !filters.housenumber_checks().0 {
+        return Ok(None);
+    }
+    let mut numbers: Vec<text::Token> = text::query_tokens(&text::fold(query))?
+        .into_iter()
+        .filter(|token| token.housenumber)
+        .collect();
+    numbers.sort_by(|a, b| a.position.cmp(&b.position));
+    let number: String = numbers.iter().map(|token| token.value.as_str()).collect();
+    let digits = number.find(|c: char| !c.is_ascii_digit()).unwrap_or(number.len());
+    if digits == 0 || digits == number.len() {
+        return Ok(None);
+    }
+    let Some(housenumber) = index.housenumber(found.doc, &housenumber_token(&number[..digits])) else {
+        return Ok(None);
+    };
+    let document = &found.document;
+    let pieces = labels(
+        &document.name.borrowed(),
+        &document.postcode.borrowed(),
+        &document.city.borrowed(),
+        Some(&housenumber.number),
+        "housenumber",
+    );
+    let labels = pieces.iter().map(|label| label.join(" ")).collect();
+    Ok(Some(Found { housenumber: Some(housenumber), labels, ..found.clone() }))
 }
 
 /// What a search did, for explaining an answer that differs from
@@ -1948,6 +1988,34 @@ mod tests {
         // House numbers among other types: matched, but not required.
         let either = filters(&["housenumber", "street"], &[], &[]);
         assert_eq!(search("9 rue lima", &either).len(), 2);
+    }
+
+    #[test]
+    fn answers_the_plain_number_a_street_holds_without_the_suffix() {
+        let index = two_communes();
+        let none = Filters::default();
+        let plain = |query: &str, filters: &Filters| {
+            let found = search_filtered(&index, query, 3, filters).unwrap();
+            plain_number(&index, query, filters, &found[0]).unwrap()
+        };
+        // The BAN has 4, not 4 bis: the street answers its 4, its scores kept.
+        let street = &search_filtered(&index, "4 bis rue lima paris", 3, &none).unwrap()[0];
+        assert_eq!(street.kind(), "street");
+        let four = plain("4 bis rue lima paris", &none).unwrap();
+        assert_eq!(four.kind(), "housenumber");
+        assert_eq!(four.id(), "75101_0001_00004");
+        assert_eq!(four.label(), "4 Rue Lima 75001 Paris");
+        assert_eq!(four.housenumber.as_ref().unwrap().number, "4");
+        assert_eq!((four.score, four.str_distance, four.importance), (street.score, street.str_distance, street.importance));
+        assert_eq!(plain("4 b rue lima paris", &none).unwrap().id(), "75101_0001_00004");
+        // Nothing else: a street without the plain number either, a number
+        // without a suffix, a number already matched, a street filter.
+        assert!(plain("4 bis rue lima lyon", &none).is_none());
+        assert!(plain("5 bis rue lima paris", &none).is_none());
+        assert!(plain("5 rue lima paris", &none).is_none());
+        assert!(plain("4 rue lima paris", &none).is_none());
+        assert!(plain("rue lima paris", &none).is_none());
+        assert!(plain("4 bis rue lima paris", &filters(&["street"], &[], &[])).is_none());
     }
 
     // The orders below are addok-rs's own, on small indexes of its own.

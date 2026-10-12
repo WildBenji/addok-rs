@@ -121,11 +121,17 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
         },
     };
     let with_bom = with_bom(request)?;
-    // Not addok-csv's: the postcode fallback, off unless asked for.
+    // Not addok-csv's: the postcode fallback and the plain number, off
+    // unless asked for.
     let postcode_fallback = match param("postcode_fallback").map(|value| flag(value).ok_or(value)) {
         None => false,
         Some(Ok(on)) => on,
         Some(Err(value)) => return bad(format!("Invalid parameter \"postcode_fallback\": {value}")),
+    };
+    let plain_number = match param("plain_number").map(|value| flag(value).ok_or(value)) {
+        None => false,
+        Some(Ok(on)) => on,
+        Some(Err(value)) => return bad(format!("Invalid parameter \"plain_number\": {value}")),
     };
 
     let (dialect, fieldnames, records, columns) = table(request, &content, dialect);
@@ -164,7 +170,7 @@ pub fn search_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Result
             Some(Ok(center)) => center,
             Some(Err(title)) => return bad(format!("{title}, row {}", i + 1)),
         };
-        let geocoded = geocode(index, &query, &filters, center, min_score, postcode_fallback).unwrap_or_else(|_| {
+        let geocoded = geocode(index, &query, &filters, center, min_score, postcode_fallback, plain_number).unwrap_or_else(|_| {
             too_long.push(i + 1);
             None
         });
