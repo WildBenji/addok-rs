@@ -47,7 +47,7 @@ Quel que soit le mode, il faut d'abord [construire l'index](#3-construire-lindex
 
 ### Avec l'image Docker (recommandé)
 
-L'image est publiée sur le GitHub Container Registry pour **linux/amd64** et **linux/arm64**. Elle ne contient que le binaire, sur Debian, et tourne sous un utilisateur système sans privilèges.
+L'image est publiée sur le GitHub Container Registry pour **linux/amd64** et **linux/arm64**. Elle ne contient que le binaire et les deux bibliothèques qu'il utilise (glibc et libgcc, sur une base Debian « distroless », sans shell ni gestionnaire de paquets), et tourne sous un utilisateur sans privilèges.
 
 ```sh
 docker pull ghcr.io/wildbenji/addok-rs
@@ -81,6 +81,8 @@ Dans la suite, `addok-cli` désigne ce binaire.
 | **Cœurs** | un seul | tous ceux disponibles, ou `--cores N` |
 
 Prévoyez le double de place pour l'index pendant une mise à jour : l'ancien reste en place jusqu'à la fin de la construction du nouveau.
+
+`addok-cli batch` garde en mémoire tout le fichier et ses résultats : comptez au plus 1,6 Ko par ligne en plus de l'index (3 Go mesurés en pointe pour un million de lignes, index compris, soit de l'ordre de 12 Go pour 7,7 millions). Pour un fichier plus gros que la mémoire disponible, découpez-le en morceaux géocodés l'un après l'autre.
 
 ---
 
@@ -242,7 +244,7 @@ Serving HTTP on 0.0.0.0:7878, on 8 cores…
 | `--cores N` | Nombre de cœurs pour géocoder, de 1 au nombre disponible | tous |
 
 - **Le démarrage est instantané :** l'index est projeté en mémoire, pas chargé. Les premières requêtes sont un peu plus lentes, le temps que le système mette l'index en cache.
-- **L'arrêt se fait avec `Ctrl-C`.** Le serveur finit les requêtes en cours avant de s'arrêter.
+- **L'arrêt se fait avec `Ctrl-C`, ou le signal SIGTERM** (`kill`, systemd, `docker stop`). Le serveur finit les requêtes en cours avant de s'arrêter.
 - **Chaque requête est traitée sur un cœur,** ses lignes dans l'ordre, et au plus `--cores` requêtes sont traitées en même temps ; les suivantes attendent leur tour. Pour occuper tous les cœurs, un client doit donc envoyer plusieurs requêtes à la fois (voir [Exemples de clients](#7-exemples-de-clients)).
 - **Dans un conteneur limité à quelques CPU,** addok-rs voit cette limite : c'est elle qui sert de défaut et de maximum pour `--cores`.
 
@@ -453,7 +455,7 @@ curl 'http://localhost:7878/reverse?lat=48.8686&lon=2.3317&limit=3&type=housenum
 | Paramètre | Rôle | Par défaut |
 |---|---|---|
 | `lat`, `lon` | La position, en degrés (obligatoires) ; `latitude`, et `lng`, `long` ou `longitude`, valent aussi | — |
-| `limit` | Le nombre de résultats, sans plafond, comme chez addok | `1` |
+| `limit` | Le nombre de résultats, sans plafond, comme chez addok ; de 1 à 100 avec `nearest` | `1` |
 | `type`, `citycode`, `postcode` | La valeur d'un [filtre](#filtrer-les-résultats) | aucun filtre |
 | `nearest` | `1` pour l'[adresse la plus proche](#ladresse-la-plus-proche--nearest) dans le rayon (propre à addok-rs) | désactivé |
 | `radius` | Le rayon de `nearest`, en mètres, jusqu'à 10 000 | `5000` |
@@ -469,7 +471,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.13.0"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.14.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -746,6 +748,8 @@ curl http://localhost:7878/health   # « documents » donne le nombre du nouvel 
 
 Avec `addok-cli batch`, il n'y a rien à redémarrer : chaque lancement ouvre l'index tel qu'il est.
 
+**Si l'index est construit sur une autre machine,** copiez-le dans le même dossier sous un autre nom, puis renommez-le (`mv`) sur l'ancien. Écraser directement le fichier qu'un serveur a ouvert (`cp`, `scp` ou `rsync --inplace`) le ferait tomber, ou lui ferait lire un mélange des deux index.
+
 ---
 
 ## 10. Mettre en production
@@ -807,6 +811,7 @@ Ensuite, deux pas facultatifs :
 | `…: name its format with --input-format or --output-format` | Extension de fichier non reconnue | Préciser `--input-format` ou `--output-format` |
 | `no column "adresse"` | Une colonne de `--columns` (ou du champ `columns`) n'existe pas dans le fichier | Vérifier les noms et la casse ; pour un CSV, vérifier aussi le séparateur |
 | `the CSV is not UTF-8` | CSV d'entrée dans un autre encodage (Windows-1252, par exemple) | Le convertir en UTF-8 |
+| `4 cells under a header of 3, row 12` | Une ligne du CSV a plus de cellules que l'en-tête : souvent un séparateur dans une adresse sans guillemets | Mettre la valeur entre guillemets, ou choisir un autre séparateur |
 | 400 `Cannot found column 'adresse' in columns ['adresse,ville,code_postal']` | `/search/csv` : une colonne demandée n'existe pas dans le fichier, quel que soit le séparateur usuel essayé | Vérifier les noms de colonnes ; pour un séparateur inhabituel, l'indiquer avec le champ `delimiter` |
 | 400 `Cannot found column 'cp' in columns [...]`, ou `no column "cp"` | Un filtre nomme une colonne que le fichier n'a pas | Vérifier le nom de la colonne donnée au filtre |
 | 400 `invalid number "abc" in column "lat", row 12` | La colonne d'un point contient autre chose qu'un nombre à cette ligne | Corriger la cellule, ou la vider pour chercher la ligne sans point |

@@ -23,7 +23,7 @@ use addok_core::reverse::{reverse, reverse_nearest};
 use addok_core::search::{Center, Found};
 use addok_core::index::Index;
 
-use crate::geocoded::{nearest_radius, python_float as read_float};
+use crate::geocoded::{coordinate as read_coordinate, nearest_radius};
 use crate::geocoded::{
     FilterColumns, Geocoded, MIN_SCORE, PositionColumns, SPLIT_COLUMNS, Warning, geocode, split_housenumber,
 };
@@ -247,7 +247,7 @@ pub fn reverse_csv<B: AsRef<[u8]>>(index: &Index<B>, request: &Request) -> Resul
         // without a result.
         let coordinate = |names: &[&str]| {
             let name = names.iter().find(|&&name| fieldnames.iter().any(|field| field == name))?;
-            read_float(pycsv::value(&fieldnames, row, name)?)
+            read_coordinate(pycsv::value(&fieldnames, row, name)?)
         };
         let center = coordinate(&["latitude", "lat"])
             .zip(coordinate(&["longitude", "lon", "lng", "long"]))
@@ -540,8 +540,9 @@ fn python_str(text: &str) -> String {
     repr
 }
 
-/// Python's `os.path.splitext(filename)[0]`.
-fn stem(filename: &str) -> &str {
+/// Python's `os.path.splitext(filename)[0]`: the name a response's file
+/// takes, on `/search/csv` as addok-csv names it, and on `/batch`.
+pub fn stem(filename: &str) -> &str {
     let base = filename.rfind('/').map_or(0, |slash| slash + 1);
     match filename.rfind('.') {
         Some(dot) if dot > base && filename[base..dot].chars().any(|c| c != '.') => &filename[..dot],

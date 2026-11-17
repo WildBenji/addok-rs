@@ -3,6 +3,7 @@ name = "addok-core"
 description = "addok-rs's engine: the index, the search and reverse geocoding, no I/O"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

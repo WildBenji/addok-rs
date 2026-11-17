@@ -122,10 +122,6 @@ pub struct Filters {
 }
 
 impl Filters {
-    pub fn is_empty(&self) -> bool {
-        self.kind.is_empty() && self.citycode.is_empty() && self.postcode.is_empty()
-    }
-
     /// addok's `_build_filters`, which makes them one key: each filter's
     /// values trimmed, empty ones dropped, the first 10 distinct kept, their
     /// documents united; then the filters' documents intersected. `None`

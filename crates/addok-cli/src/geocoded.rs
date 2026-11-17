@@ -103,7 +103,7 @@ impl PositionColumns {
             return Ok(None);
         }
         let number = |column: &str, cell: &str| {
-            python_float(cell).ok_or_else(|| format!("invalid number {cell:?} in column \"{column}\""))
+            coordinate(cell).ok_or_else(|| format!("invalid number {cell:?} in column \"{column}\""))
         };
         let center = Center { lat: number(&self.lat, lat)?, lon: number(&self.lon, lon)? };
         if !(-90.0..90.0).contains(&center.lat) {
@@ -137,6 +137,11 @@ pub fn nearest_radius<'v>(param: impl Fn(&str) -> Option<&'v str>) -> Result<Opt
             _ => Err(format!("invalid \"radius\": {value}, metres from 0 to {NEAREST_RADIUS_MAX}")),
         },
     }
+}
+
+/// A coordinate: `python_float`, but `nan` and `inf`, which are no position.
+pub fn coordinate(value: &str) -> Option<f64> {
+    python_float(value).filter(|number| number.is_finite())
 }
 
 /// Python's `float()` of a string: blanks around, digits that single
@@ -527,6 +532,15 @@ mod tests {
         assert!(read(&[("nearest", "1"), ("radius", "far")]).is_err());
         assert!(read(&[("nearest", "maybe")]).is_err());
         assert_eq!(read(&[("radius", "300")]), Err("\"radius\" goes with \"nearest\"".into()));
+    }
+
+    #[test]
+    fn a_coordinate_is_a_finite_number() {
+        assert_eq!(coordinate(" 46.5 "), Some(46.5));
+        assert_eq!(coordinate("-1_000"), Some(-1000.0));
+        for value in ["nan", "NaN", "inf", "-Infinity", "abc", ""] {
+            assert_eq!(coordinate(value), None, "{value}");
+        }
     }
 
     #[test]

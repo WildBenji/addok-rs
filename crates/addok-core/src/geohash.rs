@@ -19,10 +19,10 @@ const LAT_BITS: u32 = 5 * PRECISION as u32 / 2;
 pub type Cell = u64;
 
 /// The cell of a position: python-geohash's `encode(lat, lon, 7)`. None
-/// for a latitude outside [-90, 90), which it refuses; a longitude wraps
-/// around.
+/// for a latitude outside [-90, 90), which it refuses, and for a longitude
+/// that is not finite, which is no position; a longitude wraps around.
 pub fn encode(lat: f64, lon: f64) -> Option<Cell> {
-    if !(-90.0..90.0).contains(&lat) {
+    if !(-90.0..90.0).contains(&lat) || !lon.is_finite() {
         return None;
     }
     let lon = (lon + 180.0).rem_euclid(360.0) - 180.0;
@@ -203,6 +203,8 @@ mod tests {
     fn refuses_a_latitude_python_geohash_refuses() {
         assert_eq!(encode(90.0, 0.0), None);
         assert_eq!(encode(-90.1, 0.0), None);
+        assert_eq!(encode(46.0, f64::NAN), None);
+        assert_eq!(encode(46.0, f64::INFINITY), None);
         assert!(encode(-90.0, 0.0).is_some());
         assert_eq!(encode(10.0, 190.0), encode(10.0, -170.0));
     }

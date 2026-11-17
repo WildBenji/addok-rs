@@ -100,11 +100,14 @@ fn build(ndjson: &str, index: &str) -> Result<(), String> {
             .map_err(|e| failed = Some(format!("{ndjson}, line {}: {e}", i + 1)))
             .ok()
     });
-    // Written apart, then renamed over the index: a server mapping the old
-    // file keeps it, and a failed build leaves it whole.
+    // Written apart, synced, then renamed over the index: a server mapping
+    // the old file keeps it, and a failed build, or a power loss, leaves it
+    // whole.
     let partial = format!("{index}.partial");
     let out = File::create(&partial).map_err(|e| format!("{partial}: {e}"))?;
-    let written = write(documents, BufWriter::new(out)).map_err(|e| format!("{partial}: {e}"));
+    let written = write(documents, BufWriter::new(&out))
+        .and_then(|sizes| out.sync_all().map(|()| sizes))
+        .map_err(|e| format!("{partial}: {e}"));
     let sizes = match (written, failed) {
         (Ok(sizes), None) => sizes,
         (Err(failed), _) | (_, Some(failed)) => {
@@ -112,7 +115,10 @@ fn build(ndjson: &str, index: &str) -> Result<(), String> {
             return Err(failed);
         }
     };
-    std::fs::rename(&partial, index).map_err(|e| format!("{index}: {e}"))?;
+    std::fs::rename(&partial, index).map_err(|e| {
+        let _ = std::fs::remove_file(&partial);
+        format!("{index}: {e}")
+    })?;
     let bytes: u64 = sizes.iter().map(|(_, size)| size).sum();
     println!(
         "{index}: {:.2} GB in {} sections, written in {:.0?}",

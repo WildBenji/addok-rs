@@ -1,21 +1,14 @@
 //! The HTTP server: addok's `/search` and `/reverse`, addok-csv's
-//! `/search/csv` and `/reverse/csv` over an index, `/batch`, Parquet or CSV
-//! in and out (see `batch`), and `/health`. Each request runs its rows in
-//! order on one thread, as many requests at once as the cores it is given:
-//! requests of consecutive rows keep their caches warm.
+//! `/search/csv` and `/reverse/csv` over an index, `/batch` and
+//! `/reverse/batch`, Parquet or CSV in and out (see `batch`), and `/health`.
+//! Each request runs its rows in order on one thread, as many requests at
+//! once as the cores it is given: requests of consecutive rows keep their
+//! caches warm.
 //!
-//! `/batch` takes the file as `data`, and as parameters: `columns`, once per
-//! column a row's query joins (default: all); `input_format` and
-//! `output_format`, `parquet` or `csv` (default: the file's extension, then
-//! the input's); `input_delimiter` and `output_delimiter` (default `;`);
-//! `min_score` (default 0.5).
-//!
-//! Both take `postcode_fallback` (`1`, `true`, `on`…; default off): a row
-//! whose best result is not a confident house number is searched again
-//! without its postcode where that can help. And both take
-//! `result_columns`, once per column: `result_num`, `result_num_complement`
-//! and `result_num_complement_short` are added only when named there;
-//! other names change nothing, as addok-csv ignores them.
+//! The file routes take a multipart form, the file as `data` and each
+//! parameter in a field of its own: `batch_options`, `reverse_batch_options`
+//! and `formats` below read those of `/batch` and `/reverse/batch`,
+//! `search_csv` those of addok-csv's routes. HOW-TO-USE.md § 6 lists them.
 //!
 //! Like addok, the server trusts its client: it takes uploads of any size
 //! into memory, and `/search/csv` sniffs the whole file with Python's
@@ -33,6 +26,7 @@ use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 
 use crate::batch::{self, Format, Options, ReverseOptions};
@@ -48,8 +42,8 @@ struct Server<B> {
     permits: Arc<Semaphore>,
 }
 
-/// Serves the index on `address` until Ctrl-C, geocoding on `cores` threads
-/// at most.
+/// Serves the index on `address` until Ctrl-C or SIGTERM, geocoding on
+/// `cores` threads at most.
 pub async fn serve<B>(index: Index<B>, address: SocketAddr, cores: usize) -> std::io::Result<()>
 where
     B: AsRef<[u8]> + Send + Sync + 'static,
@@ -74,7 +68,12 @@ where
     println!("Serving HTTP on {address}, on {cores} cores…");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            // Ctrl-C, or SIGTERM from `kill`, systemd or `docker stop`.
+            let mut term = signal(SignalKind::terminate()).expect("a SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
         })
         .await
 }
@@ -245,7 +244,7 @@ where
     });
     match answer.await {
         Ok(Ok((body, warnings))) => {
-            let stem = filename.rsplit_once('.').map_or(filename.as_str(), |(stem, _)| stem);
+            let stem = search_csv::stem(&filename);
             let disposition = format!("attachment; filename=\"{stem}.geocoded.{}\"", output.extension());
             let answered = (
                 [
@@ -362,7 +361,8 @@ async fn form(mut multipart: Multipart) -> Result<Request, String> {
         let name = field.name().unwrap_or_default().to_owned();
         if name == "data" && !file {
             request.filename = field.file_name().unwrap_or_default().to_owned();
-            request.data = field.bytes().await.map_err(|e| e.body_text())?.to_vec();
+            // Reuses the upload's buffer where it can, rather than copy it.
+            request.data = Vec::from(field.bytes().await.map_err(|e| e.body_text())?);
             file = true;
         } else {
             let text = field.text().await.map_err(|e| e.body_text())?;

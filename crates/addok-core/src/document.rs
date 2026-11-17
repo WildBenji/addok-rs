@@ -49,9 +49,15 @@ pub struct Document {
 }
 
 impl Document {
-    /// One line of the BAN's NDJSON.
+    /// One line of the BAN's NDJSON. A document without `lon` and `lat` is
+    /// refused here, so that a build fails on it, rather than the searches
+    /// around a point and the GeoJSON answers that reach it.
     pub fn from_ndjson(line: &str) -> Result<Document, serde_json::Error> {
-        serde_json::from_str(line)
+        let document: Document = serde_json::from_str(line)?;
+        if document.lon.is_none() || document.lat.is_none() {
+            return Err(de::Error::custom("a document without \"lon\" and \"lat\""));
+        }
+        Ok(document)
     }
 }
 
@@ -287,6 +293,15 @@ mod tests {
     #[test]
     fn refuses_a_field_it_does_not_know() {
         let line = r#"{"id":"1","banId":null,"type":"street","name":"x","lon":1,"lat":2,"importance":0.1,"new":1}"#;
+        assert!(Document::from_ndjson(line).is_err());
+    }
+
+    #[test]
+    fn refuses_a_document_without_a_position() {
+        let line = r#"{"id":"1","banId":null,"type":"street","name":"x","lat":2,"importance":0.1}"#;
+        let refused = Document::from_ndjson(line).unwrap_err().to_string();
+        assert_eq!(refused, "a document without \"lon\" and \"lat\"");
+        let line = r#"{"id":"1","banId":null,"type":"street","name":"x","lon":null,"lat":2,"importance":0.1}"#;
         assert!(Document::from_ndjson(line).is_err());
     }
 

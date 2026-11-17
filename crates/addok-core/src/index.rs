@@ -117,8 +117,11 @@ pub struct Index<B> {
     /// The unions of a filter's values, kept once made, by filter and
     /// values: addok keeps those of over 100,000 documents in Redis, and
     /// `type=street locality` unites over a million.
-    unions: Mutex<HashMap<String, Arc<[DocId]>>>,
+    unions: Mutex<Unions>,
 }
+
+/// A filter's unions, by its name and its values, sorted.
+type Unions = HashMap<(String, Vec<String>), Arc<[DocId]>>;
 
 /// How many unions an index keeps; past that, it starts over.
 const UNIONS_KEPT: usize = 64;
@@ -435,13 +438,14 @@ impl<B: AsRef<[u8]>> Index<B> {
     pub fn filter_union(&self, name: &str, values: &[&str]) -> Arc<[DocId]> {
         let mut sorted = values.to_vec();
         sorted.sort_unstable();
-        let key = format!("{name}|{}", sorted.join("|"));
-        let mut unions = self.unions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(union) = unions.get(&key) {
+        let key = (name.to_owned(), sorted.iter().map(|&value| value.to_owned()).collect::<Vec<_>>());
+        let lock = || self.unions.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(union) = lock().get(&key) {
             return union.clone();
         }
         let lists: Vec<&[DocId]> = sorted.iter().map(|value| self.filter(name, value)).collect();
         let union: Arc<[DocId]> = crate::postings::union_sets(&lists).into();
+        let mut unions = lock();
         if unions.len() >= UNIONS_KEPT {
             unions.clear();
         }
@@ -490,6 +494,13 @@ mod tests {
     use super::*;
     use crate::document::Text;
     use crate::postings::intersect;
+
+    #[test]
+    fn a_value_holding_the_separator_makes_its_own_union() {
+        let index = build(vec![municipality()]);
+        assert!(index.filter_union("type", &["municipality|street", "locality"]).is_empty());
+        assert_eq!(&*index.filter_union("type", &["municipality", "street", "locality"]), &[0]);
+    }
 
     /// The index of these documents, written then opened.
     fn build(documents: Vec<Document>) -> Index<AlignedBytes> {

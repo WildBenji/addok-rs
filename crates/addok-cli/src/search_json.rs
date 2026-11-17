@@ -13,7 +13,7 @@ use addok_core::search::{Center, Filters, Found, Options, search_with};
 use addok_core::text::{QUERY_MAX_LENGTH, fold};
 use serde_json::{Map, Value, json};
 
-use crate::geocoded::{nearest_radius, python_float};
+use crate::geocoded::{coordinate, nearest_radius};
 use crate::search_csv::param_flag;
 
 /// The BAN's `ATTRIBUTION` and `LICENCE`.
@@ -119,7 +119,7 @@ fn coordinates(params: &[(String, String)]) -> Result<(Option<f64>, Option<f64>)
     let coordinate = |names: &[&str]| -> Result<Option<f64>, Error> {
         match names.iter().find_map(|&name| last(name).map(|value| (name, value))) {
             None => Ok(None),
-            Some((name, value)) => python_float(value).map(Some).ok_or_else(|| Error::invalid(name, "invalid value")),
+            Some((name, value)) => coordinate(value).map(Some).ok_or_else(|| Error::invalid(name, "invalid value")),
         }
     };
     let (lat, lon) = (coordinate(&LAT)?, coordinate(&LON)?);
@@ -179,6 +179,11 @@ pub fn read_reverse(params: &[(String, String)]) -> Result<ReverseRequest, Error
         Some(None) => return Err(Error::invalid("limit", "The value must be an integer.")),
     };
     let nearest = nearest_radius(last).map_err(|title| Error::bad(&title, None))?;
+    // Not addok's: `nearest` explores rings until it holds `limit`
+    // results, so it takes `/search`'s range rather than any limit.
+    if nearest.is_some() && !(1..=100).contains(&limit) {
+        return Err(Error::invalid("limit", "out of range (1..100)"));
+    }
     let named = filters(params);
     let filters = search_filters(&named);
     Ok(ReverseRequest { center: Center { lat, lon }, limit, filters, nearest, named })
@@ -448,6 +453,13 @@ mod tests {
         let given = params(&[("lat", "48"), ("lon", "2"), ("nearest", "1"), ("radius", "800")]);
         assert_eq!(read_reverse(&given).unwrap().nearest, Some(800.0));
         assert_eq!(read_reverse(&params(&[("lat", "48"), ("lon", "2")])).unwrap().nearest, None);
+        // With it, `/search`'s range of limits.
+        let nearest = |limit: &str| read(&[("lat", "48"), ("lon", "2"), ("nearest", "1"), ("limit", limit)]);
+        assert_eq!(nearest("100"), Ok((48.0, 2.0, 100)));
+        assert_eq!(nearest("0"), Ok((48.0, 2.0, 1)));
+        for limit in ["101", "-1"] {
+            assert_eq!(nearest(limit).unwrap_err().description.unwrap(), "The \"limit\" parameter is invalid. out of range (1..100)");
+        }
     }
 
     #[test]

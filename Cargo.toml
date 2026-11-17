@@ -3,8 +3,10 @@ members = ["crates/addok-core", "crates/addok-cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
+# The floor parquet and arrow 60 set; checked with cargo +1.88.0 check.
+rust-version = "1.88"
 authors = ["Benjamin Baret <bbaret@klarsen.com>"]
 license = "MIT"
 repository = "https://github.com/WildBenji/addok-rs"

@@ -26,7 +26,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
 use crate::geocoded::{
-    FilterColumns, Geocoded, PositionColumns, SPLIT_COLUMNS, Warning, geocode, python_float, split_housenumber,
+    FilterColumns, Geocoded, PositionColumns, SPLIT_COLUMNS, Warning, coordinate, geocode, split_housenumber,
 };
 use crate::pycsv::{self, Dialect};
 
@@ -166,6 +166,14 @@ pub fn read(bytes: Vec<u8>, format: Format) -> Result<RecordBatch, Error> {
             let mut records = pycsv::records(text, &dialect(delimiter)).into_iter();
             let header = records.next().unwrap_or_default();
             let rows: Vec<Vec<String>> = records.filter(|row| !row.is_empty()).collect();
+            // A cell past the header's has no column to go to: refused
+            // rather than lost, often a delimiter inside an unquoted
+            // address. An empty one, a trailing delimiter, loses nothing.
+            let past = |row: &Vec<String>| row.iter().skip(header.len()).any(|cell| !cell.is_empty());
+            if let Some(row) = rows.iter().position(past) {
+                let cells = rows[row].len();
+                return Err(Error(format!("{cells} cells under a header of {}, row {}", header.len(), row + 1)));
+            }
             let columns = (0..header.len()).map(|i| {
                 let values = rows.iter().map(|row| row.get(i).map(String::as_str));
                 Arc::new(values.collect::<StringArray>()) as ArrayRef
@@ -324,11 +332,11 @@ fn coordinates(table: &RecordBatch, name: &str) -> Result<Vec<Option<f64>>, Erro
     if column.data_type().is_numeric() {
         let numbers = cast(column, &DataType::Float64).map_err(error)?;
         let numbers = numbers.as_any().downcast_ref::<Float64Array>().unwrap();
-        return Ok(numbers.iter().collect());
+        return Ok(numbers.iter().map(|number| number.filter(|number| number.is_finite())).collect());
     }
     let text = cast(column, &DataType::Utf8).map_err(error)?;
     let text = text.as_any().downcast_ref::<StringArray>().unwrap();
-    Ok(text.iter().map(|value| value.and_then(python_float)).collect())
+    Ok(text.iter().map(|value| value.and_then(coordinate)).collect())
 }
 
 /// The reverse result columns of these rows, in `REVERSE_RESULTS`' order.
@@ -367,6 +375,11 @@ fn reverse_columns(rows: &[Option<Found>]) -> Vec<ArrayRef> {
 /// 1,000 consecutive rows at a time: rows next to each other share their
 /// index pages and caches.
 fn in_blocks<T: Send>(rows: usize, threads: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    // One thread's rows run on the caller's: over HTTP, a blocking-pool
+    // thread that keeps its phonetics cache from one request to the next.
+    if threads <= 1 {
+        return (0..rows).map(f).collect();
+    }
     let blocks: Vec<std::ops::Range<usize>> = (0..rows).step_by(1_000).map(|start| start..(start + 1_000).min(rows)).collect();
     let next = AtomicUsize::new(0);
     let mut done: Vec<(usize, Vec<T>)> = std::thread::scope(|scope| {
@@ -607,6 +620,15 @@ mod tests {
         filtered.filters.postcode = vec!["zip".to_owned()];
         let refused = geocode_table(&index(), &table, &filtered);
         assert_eq!(refused, Err(Error("no column \"zip\"".into())));
+    }
+
+    #[test]
+    fn refuses_a_csv_row_longer_than_its_header() {
+        let read_csv = |csv: &str| read(csv.as_bytes().to_vec(), Format::Csv { delimiter: ';' });
+        let refused = read_csv("num;voie;ville\n12;3 RUE X; BAT B;PARIS\n").unwrap_err();
+        assert_eq!(refused, Error("4 cells under a header of 3, row 1".into()));
+        // A trailing delimiter adds an empty cell, and loses nothing.
+        assert_eq!(read_csv("a;b\n1;2;\n3;4\n").unwrap().num_rows(), 2);
     }
 
     #[test]

@@ -133,7 +133,7 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 
 ### Des réponses reproductibles
 
-- **Les ex æquo sont départagés par une règle explicite et documentée :** le score, puis l'importance, puis l'identifiant BAN. Avec le même index, la même requête donne toujours la même réponse, d'un redémarrage à l'autre et d'une machine à l'autre.
+- **Les ex æquo sont départagés par une règle explicite et documentée :** le score, puis l'importance, puis l'identifiant BAN. Avec le même index, la même requête donne toujours la même réponse, d'un redémarrage à l'autre et d'une machine à l'autre sous le même système. Entre macOS et Linux, un score calculé autour d'un point peut différer au dernier chiffre, comme chez addok : la distance passe par la fonction puissance du système.
 - **Les règles sont celles d'addok 1.3.2,** la version amont la plus récente, et non celles de l'image de 2022.
 
 ### Mieux qu'addok, à la demande

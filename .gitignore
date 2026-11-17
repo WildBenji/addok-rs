@@ -1,2 +1,8 @@
 # Rust build output
 target/
+# Indexes and address files: built or brought locally, never committed
+/data/
+*.addok
+*.addok.partial
+/*.parquet
+/*.csv

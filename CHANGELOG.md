@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.14.0 — 2026-11-17
+
+Security and robustness: patched dependencies, a smaller image pinned by digest, and inputs that were silently mishandled now refused. The index format is unchanged: no rebuild.
+
+### Security
+
+- **Dependencies past their advisories:** `zstd` 0.14.4, `zstd-safe` 8.3.0, `zstd-sys` 2.1.3, `arrow` and `parquet` 60.1.0, `tokio` 1.54.1. They close RUSTSEC-2026-0391, -0398, -0403 and -0410, and the unsound warnings in `zstd-safe`, `arrow-data` (RUSTSEC-2026-0442) and `tokio` (RUSTSEC-2026-0386). The zstd chain decodes the Parquet files `/batch` and `/reverse/batch` receive.
+- **The image runs on `gcr.io/distroless/cc-debian13`** instead of `debian:trixie-slim`: 14 packages instead of 78, no shell, no package manager. Against the Debian security tracker, its open CVEs drop from 67 to 32, those of the glibc and libgcc the binary needs, and none with a fix left uninstalled. It runs as distroless's `nonroot` user (uid 65532): a mounted index must be readable by others, as the usual 644 permissions allow.
+- **One request could change another's filtered answers.** The cache of filter unions keyed on the values joined with `|`, so `type=locality|municipality&type=street` and `type=locality municipality street` shared an entry, for every client of the server. The key is now the values themselves.
+
+### Changed
+
+- **A coordinate is a finite number.** `nan` and `inf`, which Python's `float()` reads and float Parquet columns carry, were taken as positions: reverse answered an address on the Greenwich meridian at distance 0, and `/search` answered nothing. They are now refused on `/search` and `/reverse` (400) and in named position columns (400 naming the row), and leave a row without a result on `/reverse/csv` and in reverse batches, like any value that is not a number.
+- **With `nearest`, `/reverse` takes a `limit` from 1 to 100,** as `/search` does. Unbounded, one request explored every ring to the radius: 240 ms and 9.3 MB in central Paris. Without `nearest`, the limit stays unchecked, as in addok.
+- **A CSV row with more cells than its header is refused,** by its number, on `/batch`, `/reverse/batch`, `addok-cli batch` and `addok-cli reverse`. Its extra cells were dropped without a word, and an unquoted delimiter in an address shifted the row. An empty extra cell, from a trailing delimiter, is still read.
+- **`addok-cli build` refuses a document without `lon` and `lat`,** naming its line, rather than building an index whose searches around a point would fail on it. The current BAN has none.
+- **`/batch` names its answer as `/search/csv` does** (Python's `splitext`): a file named `.hidden` gives `.hidden.geocoded.parquet`.
+- **The minimum Rust version is declared: 1.88.**
+
+### Fixed
+
+- **The server stops gracefully on SIGTERM** as well as Ctrl-C: under systemd, a supervisor or `kill`, requests in flight were cut. `docker stop` needs no special stop signal any more.
+- **The built index is synced to disk before it replaces the old one,** so a power loss cannot leave a short index in its place, and the partial file is removed when the final rename fails.
+- **`/batch` and `/reverse/batch` keep their phonetics cache from one request to the next,** as `/search/csv` does: 135 ms instead of 158 for a request of 1,000 addresses on one core. An uploaded file is no longer copied once more in memory.
+- **The image's tests run on its own platform,** linux/amd64 and linux/arm64, before it is built. Both base images and every action of the publishing workflow are pinned, by digest and by commit.
+
+### Documentation
+
+- **The memory `addok-cli batch` needs:** at most 1.6 KB a row beyond the index, about 12 GB for 7.7 million rows; split a larger file.
+- **Replacing a served index:** copy it beside the old one and rename it; copying over the file a server has open brings it down.
+- **Determinism across systems:** a score around a point can differ in its last digit between macOS and Linux, as addok's does.
+
 ## v0.13.0 — 2026-10-12
 
 The plain number when the BAN lacks the suffix, a third improvement, off by default. The index is unchanged: no rebuild.
