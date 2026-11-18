@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.15.0 — 2026-11-17
+
+A faster binary, built with link-time optimization. No change in answers, and the index format is unchanged: no rebuild.
+
+### Changed
+
+- **Release builds use thin link-time optimization and a single codegen unit.** Geocoding on one core is 3.6% faster (median of 7 interleaved rounds on 100,000 real addresses), and 4.0% on a recheck. The server answers each request on one core, so each request gains as much; on 8 cores the gain is within run-to-run spread. Answers are byte-identical, `postcode_fallback` and `plain_number` included.
+- **Building takes longer:** a first `cargo build --release` takes a few minutes, a release rebuild after a change about 45 s instead of 6, and the image's build stage about twice as long. The guide says so.
+
 ## v0.14.0 — 2026-11-17
 
 Security and robustness: patched dependencies, a smaller image pinned by digest, and inputs that were silently mishandled now refused. The index format is unchanged: no rebuild.

@@ -3,7 +3,7 @@ members = ["crates/addok-core", "crates/addok-cli"]
 resolver = "3"
 
 [workspace.package]
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 # The floor parquet and arrow 60 set; checked with cargo +1.88.0 check.
 rust-version = "1.88"
@@ -11,3 +11,12 @@ authors = ["Benjamin Baret <bbaret@klarsen.com>"]
 license = "MIT"
 repository = "https://github.com/WildBenji/addok-rs"
 publish = false
+
+# Measured on 100,000 corpus rows, one core, 7 interleaved rounds (medians):
+# +3.6% against Cargo's defaults (thin LTO alone +1.3%, fat LTO with one unit
+# +2.2%), the answers byte-identical. The cost is build time: a release
+# rebuild after touching addok-core takes 44 s instead of 6 (fat: 104 s), and
+# the image's build stage 172 s instead of 86.
+[profile.release]
+lto = "thin"
+codegen-units = 1
