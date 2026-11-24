@@ -66,8 +66,11 @@ struct Candidate {
 impl Candidate {
     /// The candidate made a result, labelled.
     fn found<B: AsRef<[u8]>>(self, index: &Index<B>) -> Found {
-        let document = index.document(self.doc);
+        let mut document = index.document(self.doc);
         let housenumber = self.at.map(|at| index.housenumber_at(self.doc, at));
+        if let Some(number) = &housenumber {
+            number.answer_own(&mut document);
+        }
         let labels = labels(&document, housenumber.as_ref().map(|number| number.number.as_str()));
         Found {
             doc: self.doc,

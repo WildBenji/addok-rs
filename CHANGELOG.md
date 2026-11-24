@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.16.1 — 2026-11-24
+
+A dependency past its advisory. No change in answers, and the index format is v0.16.0's.
+
+### Security
+
+- **`parquet` and `arrow` 60.2.0,** past RUSTSEC-2026-0595 (CVE-2026-125651): `parquet` 60.1.0 wrote a column's Bloom filter in plaintext inside an encrypted Parquet file. addok-rs never encrypts the Parquet it writes, so its files were not exposed.
+
+## v0.16.0 — 2026-11-24
+
+Each house number can answer its own former commune. **The index format changes: rebuild required.**
+
+### Added
+
+- **`addok-cli build … --numbers adresses-france.csv.gz`** reads the BAN's per-address CSV beside the NDJSON. A house-number answer then carries the number's own former commune, in `oldcitycode` and `oldcity`, wherever it differs from its street's. This applies to `/search`, `/search/csv`, `/batch`, the plain number and reverse.
+  - **Why:** the NDJSON gives every number of a street the street's former commune, which is its first address's. On the BAN of 2026-11-24, that is wrong for 19,178 numbers in 3,064 streets. Where a number's position lies within a former commune's official boundary (COG 2026), that boundary is the CSV's former commune 94% of the time, and the NDJSON's 4%.
+  - **Answers only.** Scores, ranking, filters, labels and every other field stay as before. On 88,811 real address queries, 27 answers change, in those two fields only.
+  - **The postcode stays the street's, on purpose.** The CSV also gives each number a postcode, but compared with the postcodes businesses declare at the same addresses (SIRENE), it is right only about half the time where the two exports disagree, and wrong across whole communes. Its source has not been updated since 2023, and the State's geocoder answers the street's postcode too.
+  - **The build takes longer:** about 75 s more (64 s of it reading the CSV), and 3.4 GB of memory instead of 3.0. The index grows by 0.26 MB.
+  - **Without `--numbers`,** the index answers as before, as addok does.
+
+### Changed
+
+- **The index format is version 2.** An index built by an earlier version is refused with ``ban.addok: index format version 1; this build reads version 2; rebuild it with `addok-cli build` ``, and an earlier version refuses a new index the same way. Rebuild with `addok-cli build`.
+
 ## v0.15.0 — 2026-11-17
 
 A faster binary, built with link-time optimization. No change in answers, and the index format is unchanged: no rebuild.

@@ -76,8 +76,8 @@ Dans la suite, `addok-cli` désigne ce binaire.
 
 | | Construction de l'index | Géocodage |
 |---|---|---|
-| **Mémoire** | environ 3 Go (pic mesuré : 2,7 Go) | de quoi garder en cache l'essentiel de l'index (1,94 Go), en plus du reste |
-| **Disque** | 1,3 Go pour l'export de la BAN, 1,9 Go pour l'index | 1,9 Go pour l'index |
+| **Mémoire** | environ 3 Go (pic mesuré : 2,7 Go), 3,4 Go avec [`--numbers`](#lancienne-commune-propre-à-chaque-numéro----numbers) | de quoi garder en cache l'essentiel de l'index (1,94 Go), en plus du reste |
+| **Disque** | 1,3 Go pour l'export de la BAN (0,9 Go de plus avec `--numbers`), 1,9 Go pour l'index | 1,9 Go pour l'index |
 | **Cœurs** | un seul | tous ceux disponibles, ou `--cores N` |
 
 Prévoyez le double de place pour l'index pendant une mise à jour : l'ancien reste en place jusqu'à la fin de la construction du nouveau.
@@ -116,7 +116,7 @@ docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" --entrypoint addok-cl
 L'option `--user` fait écrire l'index sous votre utilisateur plutôt que sous celui de l'image. La construction affiche :
 
 ```
-ban.addok: 1.94 GB in 44 sections, written in 88s
+ban.addok: 1.95 GB in 45 sections, written in 84s
 ```
 
 - **L'export peut être compressé ou non :** `build` lit le `.ndjson.gz` tel quel, ou un `.ndjson` décompressé.
@@ -124,15 +124,44 @@ ban.addok: 1.94 GB in 44 sections, written in 88s
 - **L'index en place n'est jamais abîmé.** Le nouveau est d'abord écrit à côté, dans `ban.addok.partial`, puis renommé d'un coup sur `ban.addok`. Si la construction échoue (ligne illisible, disque plein), l'ancien index reste intact et le fichier partiel est supprimé.
 - **Un serveur en cours d'exécution n'est pas perturbé** par une reconstruction de son propre fichier : il garde l'ancien index jusqu'à son redémarrage (voir [Mettre à jour la BAN](#9-mettre-à-jour-la-ban)).
 
+### L'ancienne commune propre à chaque numéro : `--numbers`
+
+Dans une commune nouvelle, l'export Addok donne à tous les numéros d'une voie l'ancienne commune (commune déléguée) de sa première adresse. Une voie qui traverse deux anciennes communes donne donc à une partie de ses numéros la mauvaise.
+
+L'export CSV de la BAN, lui, donne à chaque numéro sa propre ancienne commune. Avec `--numbers`, la construction le lit en plus de l'export Addok :
+
+```sh
+curl -LO https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-france.csv.gz
+addok-cli build adresses-addok-france.ndjson.gz ban.addok --numbers adresses-france.csv.gz
+```
+
+Prenez les deux fichiers de la même nuit. La construction affiche en plus le nombre de numéros lus :
+
+```
+adresses-france.csv.gz: 26084804 house numbers in 64s
+```
+
+- **Ce qui change :** une réponse de type `housenumber` donne le code et le nom de l'ancienne commune du numéro (`result_oldcitycode`, `result_oldcity`), là où ils diffèrent de ceux de la voie. Sur la BAN du 24 novembre 2026, c'est le cas de 19 178 numéros. Là où la position du numéro tombe dans le contour officiel d'une ancienne commune, c'est celle du CSV dans 94 % des cas.
+- **Ce qui ne change pas :** le score, le classement, les filtres, le libellé et tous les autres champs. Les voies, les lieux-dits et les communes répondent comme avant.
+- **Le code postal reste celui de la voie, volontairement.** Le CSV donne aussi un code postal par numéro, mais comparé aux codes postaux que déclarent les entreprises aux mêmes adresses (SIRENE), il n'est juste qu'une fois sur deux environ là où les deux exports divergent. Sa source n'est plus mise à jour depuis 2023, et le géocodeur de l'État répond lui aussi le code postal de la voie.
+- **Sans `--numbers`,** l'index répond comme addok.
+- **Le coût :** environ 75 s de construction en plus, dont 64 s de lecture du CSV, 3,4 Go de mémoire au lieu de 3, et un index plus gros de 0,26 Mo. Le géocodage n'est pas plus lent.
+
 ### Après une mise à jour d'addok-rs
 
-Le format de l'index peut gagner des sections d'une version à l'autre. Un index construit par une version plus ancienne est alors refusé avec un message explicite :
+Le format de l'index peut changer d'une version à l'autre. Un index construit par une autre version est alors refusé avec un message explicite :
+
+```
+ban.addok: index format version 1; this build reads version 2; rebuild it with `addok-cli build`
+```
+
+ou, pour une section ajoutée :
 
 ```
 ban.addok: index without a GeohashCells section: written by an older addok-rs, or damaged; rebuild it with `addok-cli build`
 ```
 
-Il suffit de relancer `addok-cli build`. C'est le cas en passant d'une version antérieure à 0.11 : l'index y a gagné les cellules géographiques de la [recherche autour d'un point](#chercher-autour-dun-point) et du [géocodage inverse](#géocodage-inverse--addok-cli-reverse). Depuis, les versions successives n'ont rien changé au format.
+Il suffit de relancer `addok-cli build`. C'est le cas en passant d'une version antérieure à 0.11 (l'index y a gagné les cellules géographiques de la [recherche autour d'un point](#chercher-autour-dun-point) et du [géocodage inverse](#géocodage-inverse--addok-cli-reverse)), et en passant à cette version, qui donne à l'index l'[ancienne commune propre à chaque numéro](#lancienne-commune-propre-à-chaque-numéro----numbers).
 
 ---
 
@@ -471,7 +500,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.15.0"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.16.1"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
@@ -600,7 +629,7 @@ Ainsi réglé, un client sur la même machine que le serveur dépasse 40 000 lig
 | `result_city` | Commune | texte |
 | `result_context` | Département, son nom et sa région, par exemple `01, Ain, Auvergne-Rhône-Alpes` | texte |
 | `result_citycode` | Code INSEE de la commune | texte |
-| `result_oldcitycode`, `result_oldcity` | Code INSEE et nom de l'ancienne commune, pour les communes fusionnées | texte |
+| `result_oldcitycode`, `result_oldcity` | Code INSEE et nom de l'ancienne commune, pour les communes fusionnées : celle de la voie, ou celle du numéro avec un index construit avec [`--numbers`](#lancienne-commune-propre-à-chaque-numéro----numbers) | texte |
 | `result_district` | Arrondissement municipal (Paris, Lyon, Marseille) | texte |
 
 En CSV, toutes ces valeurs sont du texte et une valeur absente est une cellule vide. En Parquet, une valeur absente est `null`.
@@ -727,7 +756,7 @@ Sur demande, un numéro dont la BAN n'a pas le complément rend le numéro simpl
 
 La BAN publie un nouvel export chaque nuit. Pour en profiter :
 
-1. **Téléchargez** le nouvel `adresses-addok-france.ndjson.gz` ([section 3](#télécharger-lexport)).
+1. **Téléchargez** le nouvel `adresses-addok-france.ndjson.gz` ([section 3](#télécharger-lexport)), et le nouvel `adresses-france.csv.gz` si vous construisez avec [`--numbers`](#lancienne-commune-propre-à-chaque-numéro----numbers).
 2. **Reconstruisez l'index au même endroit :**
    ```sh
    addok-cli build adresses-addok-france.ndjson.gz ban.addok
@@ -795,7 +824,7 @@ addok-rs est fait pour remplacer un addok qui géocode par lots avec `/search/cs
 Ensuite, deux pas facultatifs :
 
 - **Passer à `/batch`** pour échanger du Parquet typé plutôt que du CSV ([section 6](#post-batch)).
-- **Activer les améliorations** : le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune), le [numéro sans complément](#numéro-sans-complément--plain_number), le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) et l'[adresse la plus proche](#ladresse-la-plus-proche--nearest). addok ignore les champs `postcode_fallback`, `plain_number`, `result_columns`, `nearest` et `radius`, ce qui permet de les envoyer aux deux moteurs pendant la transition.
+- **Activer les améliorations** : le [repli sur la commune](#code-postal-faux--le-repli-sur-la-commune), le [numéro sans complément](#numéro-sans-complément--plain_number), le [numéro découpé](#le-numéro-découpé--numéro-complément-forme-courte) et l'[adresse la plus proche](#ladresse-la-plus-proche--nearest). addok ignore les champs `postcode_fallback`, `plain_number`, `result_columns`, `nearest` et `radius`, ce qui permet de les envoyer aux deux moteurs pendant la transition. L'[ancienne commune propre à chaque numéro](#lancienne-commune-propre-à-chaque-numéro----numbers), elle, se choisit à la construction de l'index.
 
 ---
 
@@ -805,6 +834,7 @@ Ensuite, deux pas facultatifs :
 |---|---|---|
 | `--cores 9: this machine has 8 cores available` | Plus de cœurs demandés que la machine (ou le conteneur) n'en offre | Choisir un nombre entre 1 et celui indiqué |
 | `--cores takes a whole number from 1 to 8, not "0"` | Valeur non entière, nulle ou négative | Donner un entier positif |
+| `index format version 1; this build reads version 2; rebuild it with addok-cli build` | Index construit par une autre version d'addok-rs | Relancer `addok-cli build` |
 | `index without a GeohashCells section: written by an older addok-rs, or damaged; rebuild it with addok-cli build` | Index construit par une version plus ancienne d'addok-rs (avant la 0.11, ou avant une autre section ajoutée depuis), ou fichier abîmé | Relancer `addok-cli build` |
 | `not an addok-rs index` | Le fichier n'est pas un index addok-rs | Vérifier le chemin passé à `serve` ou `batch` |
 | `adresses-addok-france.ndjson.gz, line 3: …` | Ligne illisible dans l'export de la BAN, souvent un téléchargement interrompu | Télécharger l'export à nouveau ; l'ancien index est intact |

@@ -17,7 +17,7 @@ use bytemuck::Pod;
 pub use format::{AlignedBytes, OpenError};
 use format::{Kind, Sections, Strings};
 
-use crate::document::{Document, HouseNumber, Number, TextRef};
+use crate::document::{Document, HouseNumber, Number, NumberFields, Text, TextRef};
 use crate::postings::{DocId, PostingList};
 use crate::text;
 
@@ -101,11 +101,94 @@ pub fn write(
     documents: impl IntoIterator<Item = Document>,
     out: impl Write,
 ) -> io::Result<Vec<(&'static str, u64)>> {
+    write_with_number_fields(documents, &NumberTable::default(), out)
+}
+
+/// `write`, each house number answering the former commune `numbers` gives
+/// it by its `id` rather than its street's: the BAN's per-address CSV knows
+/// each number's, which the NDJSON gives from its street. A number
+/// `numbers` does not hold keeps its street's.
+pub fn write_with_number_fields(
+    documents: impl IntoIterator<Item = Document>,
+    numbers: &NumberTable,
+    out: impl Write,
+) -> io::Result<Vec<(&'static str, u64)>> {
     let mut builder = build::Builder::default();
-    for document in documents {
+    for mut document in documents {
+        let mut housenumbers = document.housenumbers.take();
+        for number in housenumbers.iter_mut().flatten() {
+            if let Some(row) = numbers.get(&number.id) {
+                number.own = own_fields(&document, row);
+            }
+        }
+        document.housenumbers = housenumbers;
         builder.add(document);
     }
     builder.write(out)
+}
+
+/// What a number's row holds that its street does not. A row without a
+/// former commune has none.
+fn own_fields(street: &Document, [oldcitycode, oldcity]: [Option<&str>; 2]) -> NumberFields {
+    let differs = |text: &Text, value: Option<&str>| match (text, value) {
+        (Text::Absent | Text::Null, None) => false,
+        (Text::One(own), Some(value)) => own != value,
+        _ => true,
+    };
+    let text = |value: Option<&str>| value.map_or(Text::Null, |value| Text::One(value.to_owned()));
+    NumberFields {
+        oldcitycode: differs(&street.oldcitycode, oldcitycode).then(|| text(oldcitycode)),
+        oldcity: differs(&street.oldcity, oldcity).then(|| text(oldcity)),
+    }
+}
+
+/// Each house number's former commune by its `id`, as the
+/// BAN's per-address CSV writes them: what `write_with_number_fields`
+/// takes. Compact, its strings shared, for the BAN's 26 million numbers
+/// to fit beside a build.
+#[derive(Default)]
+pub struct NumberTable {
+    strings: Vec<Box<str>>,
+    interned: HashMap<Box<str>, u32>,
+    rows: HashMap<Box<str>, [u32; 2]>,
+}
+
+impl NumberTable {
+    /// A number's row, an empty value standing for none. A later row of
+    /// the same id replaces it: of a street's numbers sharing a key, the
+    /// NDJSON keeps the last.
+    pub fn insert(&mut self, id: &str, oldcitycode: &str, oldcity: &str) {
+        let row = [oldcitycode, oldcity].map(|value| self.intern(value));
+        self.rows.insert(id.into(), row);
+    }
+
+    fn intern(&mut self, value: &str) -> u32 {
+        if value.is_empty() {
+            return u32::MAX;
+        }
+        if let Some(&number) = self.interned.get(value) {
+            return number;
+        }
+        let number = u32::try_from(self.strings.len()).expect("fewer than 2^32 values");
+        self.strings.push(value.into());
+        self.interned.insert(value.into(), number);
+        number
+    }
+
+    /// How many numbers it holds.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// A number's former commune code and name, if it holds its row.
+    pub fn get(&self, id: &str) -> Option<[Option<&str>; 2]> {
+        let row = self.rows.get(id)?;
+        Some(row.map(|value| self.strings.get(value as usize).map(|value| &**value)))
+    }
 }
 
 /// An index, read in place from its bytes: a memory-mapped file, or the
@@ -355,6 +438,23 @@ impl<B: AsRef<[u8]>> Index<B> {
             Some(encoding::uuid_text(&self.array(Kind::HnBanIds)[position]))
         };
         let [x, y, lon, lat] = self.housenumber_coordinates(position);
+        let owns: &[[u32; 3]] = self.array(Kind::HnOwnFields);
+        let own = match owns.binary_search_by_key(&at, |entry| entry[0]) {
+            Err(_) => NumberFields::default(),
+            Ok(found) => {
+                let strings = self.strings(Kind::Strings, Kind::StringOffsets);
+                let text = |value: u32| match value {
+                    encoding::OWN_STREET => None,
+                    encoding::OWN_NONE => Some(Text::Null),
+                    _ => Some(Text::One(strings.get(value as usize).to_owned())),
+                };
+                let [_, oldcitycode, oldcity] = owns[found];
+                NumberFields {
+                    oldcitycode: text(oldcitycode),
+                    oldcity: text(oldcity),
+                }
+            }
+        };
         HouseNumber {
             number,
             id,
@@ -363,6 +463,7 @@ impl<B: AsRef<[u8]>> Index<B> {
             y,
             lon,
             lat,
+            own,
         }
     }
 
@@ -492,7 +593,6 @@ fn edge_ngrams(token: &str) -> impl Iterator<Item = &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::Text;
     use crate::postings::intersect;
 
     #[test]
@@ -532,6 +632,7 @@ mod tests {
             y: Number::Float(6548127.24),
             lon: Number::Float(5.423167),
             lat: Number::Float(46.006992),
+            own: NumberFields::default(),
         }
     }
 
@@ -820,6 +921,58 @@ mod tests {
         assert_eq!(index.housenumber(0, "trez"), Some(odd));
         assert_eq!(index.housenumber(0, "un"), None);
         assert_eq!(index.document(0).housenumbers, None);
+    }
+
+    #[test]
+    fn answers_a_house_number_s_own_former_commune() {
+        let elsewhere = |number, id, lat| HouseNumber { lat: Number::Float(lat), ..housenumber(number, id) };
+        let street = Document {
+            oldcitycode: one("01999"),
+            oldcity: one("Varey"),
+            housenumbers: Some(vec![
+                housenumber("22", "01002_0110_00022"),
+                elsewhere("16", "01002_0110_00016", 46.1),
+                elsewhere("30", "01002_0110_00030", 46.2),
+                elsewhere("40", "01002_0110_00040", 46.3),
+            ]),
+            ..street()
+        };
+        let mut numbers = NumberTable::default();
+        numbers.insert("01002_0110_00022", "01998", "Arandas");
+        // The last row of an id is the one kept: none.
+        numbers.insert("01002_0110_00022", "", "");
+        // Its street's, written again: nothing of its own.
+        numbers.insert("01002_0110_00016", "01999", "Varey");
+        numbers.insert("01002_0110_00030", "01998", "Arandas");
+        let mut bytes = AlignedBytes::default();
+        write_with_number_fields(vec![street], &numbers, &mut bytes).unwrap();
+        let index = Index::open(bytes).unwrap();
+        let found = |query| crate::search::search(&index, query, 1).unwrap().remove(0);
+        let answered = |found: &crate::search::Found| {
+            let document = &found.document;
+            (document.postcode.clone(), document.oldcitycode.clone(), document.oldcity.clone())
+        };
+        // The postcode stays the street's.
+        let none_of_its_own = (one("01640"), Text::Null, Text::Null);
+        let street_s = (one("01640"), one("01999"), one("Varey"));
+        let arandas = (one("01640"), one("01998"), one("Arandas"));
+        assert_eq!(answered(&found("22 montee de la foret")), none_of_its_own);
+        assert_eq!(answered(&found("16 montee de la foret")), street_s);
+        assert_eq!(answered(&found("40 montee de la foret")), street_s);
+        let thirty = found("30 montee de la foret");
+        assert_eq!(answered(&thirty), arandas);
+        assert_eq!(thirty.label(), "30 Montee de la Foret 01640 L'Abergement-de-Varey");
+        // The street itself keeps its own.
+        assert_eq!(answered(&found("montee de la foret")), street_s);
+        // Its plain number and reverse answer it too.
+        let none = crate::search::Filters::default();
+        let query = "30 bis montee de la foret";
+        let plain = crate::search::plain_number(&index, query, &none, &found(query)).unwrap().unwrap();
+        assert_eq!(answered(&plain), arandas);
+        let near = crate::search::Center { lat: 46.2, lon: 5.423167 };
+        let reversed = crate::reverse::reverse(&index, near, 1, &none).remove(0);
+        assert_eq!(reversed.id(), "01002_0110_00030");
+        assert_eq!(answered(&reversed), arandas);
     }
 
     #[test]

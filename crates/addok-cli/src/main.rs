@@ -1,7 +1,7 @@
 //! addok-rs's command line.
 //!
 //! ```sh
-//! addok-cli build adresses-addok-france.ndjson.gz ban.addok
+//! addok-cli build adresses-addok-france.ndjson.gz ban.addok --numbers adresses-france.csv.gz
 //! addok-cli serve ban.addok --host 0.0.0.0 --port 7878
 //! addok-cli batch ban.addok addresses.parquet geocoded.parquet --columns ad3,city,zip_code
 //! addok-cli reverse ban.addok positions.parquet addresses.parquet --nearest on
@@ -18,13 +18,17 @@ use addok_cli::batch::{self, Format, Options, ReverseOptions};
 use addok_cli::geocoded::{FilterColumns, MIN_SCORE, PositionColumns, nearest_radius};
 use addok_cli::search_csv::flag;
 use addok_core::document::Document;
-use addok_core::index::{Index, OpenError, write};
+use addok_core::index::{Index, NumberTable, OpenError, write_with_number_fields};
 use flate2::read::MultiGzDecoder;
 use memmap2::Mmap;
 
 const USAGE: &str = "\
 usage:
-  addok-cli build <ndjson[.gz]> <index>    index the BAN's NDJSON into a file
+  addok-cli build <ndjson[.gz]> <index> [--numbers <csv[.gz]>]
+                                           index the BAN's NDJSON into a file
+    --numbers FILE            the BAN's per-address CSV (adresses-france.csv.gz): each house
+                              number answers its own former commune, not its street's
+                              (default: its street's, as addok)
   addok-cli serve <index> [--host HOST] [--port PORT] [--cores N]
                                            serve /search, /search/csv, /batch and their reverse
                                            counterparts (default 127.0.0.1:7878)
@@ -64,7 +68,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let done = match args[..] {
-        ["build", ndjson, index] => build(ndjson, index),
+        ["build", ndjson, index, ref options @ ..] => build(ndjson, index, options),
         ["serve", index, ref options @ ..] => serve(index, options),
         ["batch", index, input, output, ref options @ ..] => batch_file(index, input, output, options),
         ["reverse", index, input, output, ref options @ ..] => reverse_file(index, input, output, options),
@@ -83,14 +87,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// Indexes the NDJSON, gzipped or not, into a file.
-fn build(ndjson: &str, index: &str) -> Result<(), String> {
+/// Indexes the NDJSON, gzipped or not, into a file; with `--numbers`, each
+/// house number's own former commune from the CSV.
+fn build(ndjson: &str, index: &str, options: &[&str]) -> Result<(), String> {
     let start = Instant::now();
-    let file = File::open(ndjson).map_err(|e| format!("{ndjson}: {e}"))?;
-    let reader: Box<dyn Read> = match ndjson.ends_with(".gz") {
-        true => Box::new(MultiGzDecoder::new(file)),
-        false => Box::new(file),
+    let numbers = match options {
+        [] => NumberTable::default(),
+        ["--numbers", csv] => {
+            let numbers = addok_cli::numbers::read(BufReader::new(open_file(csv)?)).map_err(|e| format!("{csv}: {e}"))?;
+            println!("{csv}: {} house numbers in {:.0?}", numbers.len(), start.elapsed());
+            numbers
+        }
+        _ => return Err(USAGE.to_owned()),
     };
+    let reader = open_file(ndjson)?;
     let mut failed = None;
     let documents = BufReader::new(reader).lines().enumerate().map_while(|(i, line)| {
         let document = line
@@ -105,7 +115,7 @@ fn build(ndjson: &str, index: &str) -> Result<(), String> {
     // whole.
     let partial = format!("{index}.partial");
     let out = File::create(&partial).map_err(|e| format!("{partial}: {e}"))?;
-    let written = write(documents, BufWriter::new(&out))
+    let written = write_with_number_fields(documents, &numbers, BufWriter::new(&out))
         .and_then(|sizes| out.sync_all().map(|()| sizes))
         .map_err(|e| format!("{partial}: {e}"));
     let sizes = match (written, failed) {
@@ -127,6 +137,15 @@ fn build(ndjson: &str, index: &str) -> Result<(), String> {
         start.elapsed()
     );
     Ok(())
+}
+
+/// A file, gunzipped if its name ends in `.gz`.
+fn open_file(path: &str) -> Result<Box<dyn Read>, String> {
+    let file = File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(match path.ends_with(".gz") {
+        true => Box::new(MultiGzDecoder::new(file)),
+        false => Box::new(file),
+    })
 }
 
 /// Memory-maps the index and serves it.
@@ -327,7 +346,7 @@ fn open(path: &str) -> Result<Index<Mmap>, String> {
     // nothing writes the file while it is mapped.
     let bytes = unsafe { Mmap::map(&file) }.map_err(|e| format!("{path}: {e}"))?;
     let index = Index::open(bytes).map_err(|e| match e {
-        OpenError::MissingSection(_) => {
+        OpenError::MissingSection(_) | OpenError::Version(_) => {
             format!("{path}: {e}; rebuild it with `addok-cli build`")
         }
         _ => format!("{path}: {e}"),

@@ -320,6 +320,7 @@ fn write_housenumbers<W: Write>(
         ids,
         coordinate_exceptions,
         ban_id_texts,
+        own,
     } = housenumbers;
     let mut ends = vec![0u32];
     for &input in order {
@@ -375,6 +376,12 @@ fn write_housenumbers<W: Write>(
         .collect();
     texts.sort_unstable();
     writer.section(Kind::HnBanIdTexts, &texts)?;
+    let mut own: Vec<[u32; 3]> = own
+        .into_iter()
+        .map(|(position, [code, name])| [written(position), code, name])
+        .collect();
+    own.sort_unstable();
+    writer.section(Kind::HnOwnFields, &own)?;
     Ok(ends)
 }
 
@@ -503,6 +510,9 @@ struct HouseNumbers {
     ids: Vec<(u32, u32)>,
     coordinate_exceptions: Vec<(u32, [f64; 4])>,
     ban_id_texts: Vec<(u32, u32)>,
+    /// What they have of their own, by position: former commune code and
+    /// name, each a string or `encoding::OWN_STREET` or `OWN_NONE`.
+    own: Vec<(u32, [u32; 2])>,
 }
 
 impl HouseNumbers {
@@ -514,6 +524,15 @@ impl HouseNumbers {
         housenumber: HouseNumber,
     ) {
         let position = u32::try_from(self.numbers.len()).expect("fewer than 2^32 house numbers");
+        if !housenumber.own.is_empty() {
+            let own = &housenumber.own;
+            let mut text = |text: &Option<Text>| match text {
+                None => encoding::OWN_STREET,
+                Some(Text::One(value)) => strings.intern(value),
+                Some(_) => encoding::OWN_NONE,
+            };
+            self.own.push((position, [text(&own.oldcitycode), text(&own.oldcity)]));
+        }
         let mut flags = 0;
         let derived = encoding::derived_id(street, &housenumber.number);
         if derived.as_deref() != Some(housenumber.id.as_str()) {

@@ -85,6 +85,11 @@ pub(super) const HN_COORDINATES_EXCEPTION: u8 = 1 << 6;
 /// The banId is written apart, in `HnBanIdTexts`.
 pub(super) const HN_BAN_ID_TEXT: u8 = 1 << 7;
 
+/// In a house number's own fields (`HnOwnFields`): its street's value, and
+/// none, in place of a string.
+pub(super) const OWN_STREET: u32 = u32::MAX;
+pub(super) const OWN_NONE: u32 = u32::MAX - 1;
+
 /// House-number coordinates as fixed point: x and y in centimetres, lon and
 /// lat in millionths of a degree. Exact for every coordinate of the
 /// 2026-10-02 NDJSON; a house number with one that is not is written apart.

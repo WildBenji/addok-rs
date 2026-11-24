@@ -73,6 +73,40 @@ pub struct HouseNumber {
     pub y: Number,
     pub lon: Number,
     pub lat: Number,
+    /// What it has of its own, where its street's differs.
+    pub own: NumberFields,
+}
+
+/// A house number's own former commune, where it is not its street's: the
+/// NDJSON has none at this level and gives every number its street's, the
+/// BAN's per-address CSV has each number's (see
+/// `index::write_with_number_fields`). None: its street's. Its postcode
+/// stays its street's: the CSV's is no better.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NumberFields {
+    pub oldcitycode: Option<Text>,
+    pub oldcity: Option<Text>,
+}
+
+impl NumberFields {
+    /// Whether it has nothing of its own.
+    pub fn is_empty(&self) -> bool {
+        *self == NumberFields::default()
+    }
+}
+
+impl HouseNumber {
+    /// Its street's document made its answer's: its own former commune, if
+    /// it has one, in place of the street's.
+    pub fn answer_own(&self, street: &mut Document) {
+        let own = &self.own;
+        if let Some(oldcitycode) = &own.oldcitycode {
+            street.oldcitycode = oldcitycode.clone();
+        }
+        if let Some(oldcity) = &own.oldcity {
+            street.oldcity = oldcity.clone();
+        }
+    }
 }
 
 /// A house number's entry in the NDJSON, its number being the key.
@@ -236,6 +270,7 @@ fn housenumbers<'de, D: Deserializer<'de>>(
                     y: entry.y,
                     lon: entry.lon,
                     lat: entry.lat,
+                    own: NumberFields::default(),
                 });
             }
             Ok(Some(numbers))

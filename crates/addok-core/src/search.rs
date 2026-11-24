@@ -300,7 +300,8 @@ pub fn plain_number<B: AsRef<[u8]>>(
     let Some(housenumber) = index.housenumber(found.doc, &housenumber_token(&number[..digits])) else {
         return Ok(None);
     };
-    let document = &found.document;
+    let mut document = found.document.clone();
+    housenumber.answer_own(&mut document);
     let pieces = labels(
         &document.name.borrowed(),
         &document.postcode.borrowed(),
@@ -309,7 +310,7 @@ pub fn plain_number<B: AsRef<[u8]>>(
         "housenumber",
     );
     let labels = pieces.iter().map(|label| label.join(" ")).collect();
-    Ok(Some(Found { housenumber: Some(housenumber), labels, ..found.clone() }))
+    Ok(Some(Found { document, housenumber: Some(housenumber), labels, ..found.clone() }))
 }
 
 /// What a search did, for explaining an answer that differs from
@@ -897,11 +898,15 @@ impl<'i, B: AsRef<[u8]>> Helper<'i, B> {
 
     /// A document `score` scored, made a result.
     fn result(&self, doc: DocId, scored: Scored) -> Found {
-        let document = self.index.document(doc);
+        let mut document = self.index.document(doc);
         let housenumber = match self.housenumber.is_empty() || !self.check_housenumber {
             true => None,
             false => self.index.housenumber(doc, &self.housenumber),
         };
+        // Its answer only: `score` compared the street's labels.
+        if let Some(number) = &housenumber {
+            number.answer_own(&mut document);
+        }
         let kind = match housenumber {
             Some(_) => "housenumber",
             None => document.kind.as_str(),

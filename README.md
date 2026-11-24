@@ -7,15 +7,112 @@
 
 addok-rs fait une seule chose : redresser et géocoder des adresses françaises, par fichiers entiers ou une à une, à partir de la [Base Adresse Nationale](https://adresse.data.gouv.fr) (BAN). Il ne cherche pas à être un moteur générique comme addok. Il reprend exactement la combinaison qu'utilise la BAN, addok et ses extensions pour la France (addok-fr, addok-france, addok-csv), et la grave dans le code : même normalisation du texte, même phonétique, même classement, mêmes scores.
 
-Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,94 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, numéro découpé, adresse la plus proche en géocodage inverse).
+Ce choix lui permet de faire ce travail mieux et beaucoup plus vite qu'addok et ses plugins ne l'ont jamais fait : un seul binaire, un index de 1,94 Go projeté en mémoire, tous les cœurs de la machine, des fichiers Parquet ou CSV en entrée comme en sortie, et des améliorations qu'addok n'offre pas (code postal faux rattrapé, ancienne commune propre à chaque numéro, numéro découpé, adresse la plus proche en géocodage inverse).
+
+> 📘 Ce README dit comment obtenir un index, comment s'en servir, et pourquoi addok-rs est fait ainsi. Le détail de chaque paramètre, les exemples de clients et la mise en production sont dans le **[guide d'utilisation](HOW-TO-USE.md)**.
+
+## Sommaire
+
+1. [Démarrage rapide](#démarrage-rapide) : télécharger l'export de la BAN, construire l'index, s'en servir
+2. [Utiliser addok-rs](#utiliser-addok-rs) : quelle interface pour quel besoin
+3. [Les choix, et pourquoi](#les-choix-et-pourquoi)
+4. [En bref](#en-bref), puis les [performances](#performances), les [limites d'addok](#les-autres-limites-daddok), [ce qu'apporte addok-rs](#ce-quapporte-addok-rs) et la [comparaison avec addok](#les-mêmes-réponses-quaddok)
+5. [Limites](#limites), [organisation du dépôt](#organisation-du-dépôt), [développer](#développer)
+
+---
+
+## Démarrage rapide
+
+Trois étapes : télécharger l'export de la BAN, construire l'index, s'en servir. Il faut Docker (ou Rust 1.88 pour compiler soi-même), et pour la construction environ 3 Go de mémoire et 4 Go de disque (5 Go avec l'export CSV).
+
+### 1. Télécharger l'export de la BAN
 
 ```sh
-docker run -d -p 7878:7878 -v "$PWD/index:/data:ro" ghcr.io/wildbenji/addok-rs
+mkdir -p index && cd index
+curl -LO https://adresse.data.gouv.fr/data/ban/adresses/latest/addok/adresses-addok-france.ndjson.gz
+# Facultatif, pour l'ancienne commune propre à chaque numéro (étape 2) :
+curl -LO https://adresse.data.gouv.fr/data/ban/adresses/latest/csv/adresses-france.csv.gz
+```
+
+- **L'export Addok** (1,3 Go) est la seule entrée obligatoire. La BAN le republie chaque nuit, et il couvre la France entière, outre-mer compris.
+- **L'export CSV** (0,9 Go) ne sert qu'à l'option `--numbers`. Prenez-le de la même nuit que l'export Addok.
+- **L'archive « prête à l'emploi »** que la BAN publie pour addok (`addok.db`, `dump.rdb`) ne sert pas : addok-rs construit son propre index.
+
+### 2. Construire l'index
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" --entrypoint addok-cli \
+  ghcr.io/wildbenji/addok-rs build /data/adresses-addok-france.ndjson.gz /data/ban.addok
+```
+
+Avec l'ancienne commune propre à chaque numéro, ajoutez `--numbers /data/adresses-france.csv.gz` à la fin de la commande.
+
+- **La construction prend environ 1 min 30 sur un seul cœur,** 3 min avec `--numbers`. Elle écrit un seul fichier, `ban.addok`, de 1,9 Go.
+- **L'ancien index reste intact jusqu'au bout :** le nouveau est écrit à côté, puis renommé d'un coup.
+- **Après une mise à jour d'addok-rs,** un index d'un format plus ancien est refusé avec un message qui dit de le reconstruire. C'est le cas en passant à la 0.16.
+
+### 3. S'en servir
+
+Servir l'index en HTTP, sur le port 7878 comme addok :
+
+```sh
+docker run -d --name addok-rs -p 7878:7878 -v "$PWD:/data:ro" ghcr.io/wildbenji/addok-rs
+curl http://localhost:7878/health
+curl "http://localhost:7878/search?q=8+bd+du+port+amiens&limit=1"
 curl -F data=@adresses.csv -F columns=adresse -F columns=ville -F columns=code_postal \
      http://localhost:7878/search/csv -o geocodees.csv
 ```
 
-> 📘 Installation, construction de l'index, référence de l'API et mise en production : voir le **[guide d'utilisation](HOW-TO-USE.md)**.
+Ou géocoder un fichier sur place, sans serveur, sur tous les cœurs :
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" --entrypoint addok-cli \
+  ghcr.io/wildbenji/addok-rs batch /data/ban.addok /data/adresses.parquet /data/geocodees.parquet \
+  --columns adresse,ville,code_postal
+```
+
+### Depuis les sources
+
+```sh
+cargo build --release
+target/release/addok-cli build adresses-addok-france.ndjson.gz ban.addok
+target/release/addok-cli batch ban.addok adresses.parquet geocodees.parquet --columns adresse,ville,code_postal
+target/release/addok-cli serve ban.addok --host 0.0.0.0
+```
+
+Une première compilation prend quelques minutes. Pour une nouvelle édition de la BAN, il suffit de retélécharger l'export, de reconstruire l'index au même endroit et de redémarrer le serveur ([guide, section 9](HOW-TO-USE.md#9-mettre-à-jour-la-ban)).
+
+---
+
+## Utiliser addok-rs
+
+| Besoin | Interface |
+|---|---|
+| Géocoder un fichier Parquet ou CSV sur la machine où il se trouve | `addok-cli batch` : ni réseau, ni découpage à gérer |
+| Remplacer un addok existant sans toucher à ses clients | `POST /search/csv`, identique à addok-csv à l'octet près, défauts corrigés |
+| Échanger des fichiers typés avec un autre programme | `POST /batch`, en Parquet ou en CSV, à l'aller comme au retour |
+| Chercher une adresse à la fois, avec ou sans autocomplétion | `GET /search`, le GeoJSON d'addok |
+| Trouver l'adresse d'une position | `GET /reverse`, `POST /reverse/csv`, `POST /reverse/batch`, `addok-cli reverse` |
+| Savoir si le serveur est prêt, et sur quel index | `GET /health` |
+
+- **Le résultat** de chaque adresse vient dans les colonnes d'addok-csv (`result_label`, `result_score`, `result_type`, `result_id`, `result_housenumber`, `result_postcode`, `result_citycode`, …). Le score va de 0 à 1 : `addok-cli batch` laisse sans résultat ce qui ne dépasse pas 0,5, réglable avec `--min-score`.
+- **Les filtres d'addok** (`type`, `citycode`, `postcode`) et la **recherche autour d'un point** (`lat`, `lon`) marchent sur toutes les interfaces. Sur un fichier, chaque ligne utilise ses propres colonnes.
+- **Les améliorations** sont désactivées par défaut, pour répondre comme addok tant qu'on ne demande rien. On les active par requête (`postcode_fallback`, `plain_number`, `nearest`, `result_columns`) ou, pour l'ancienne commune propre à chaque numéro, à la construction (`--numbers`). Voir [Mieux qu'addok, à la demande](#mieux-quaddok-à-la-demande).
+
+---
+
+## Les choix, et pourquoi
+
+- **Les réponses d'addok d'abord, scores compris.** Ceux qui utilisent addok règlent leurs seuils sur son échelle de scores : un classement « meilleur » qui la décalerait changerait en silence les adresses qu'ils retiennent. addok-rs donne donc les réponses d'addok, et chaque amélioration est mesurée sur des adresses réelles, puis désactivée par défaut.
+- **La référence est addok 1.3.2, pas l'image Docker.** L'image `etalab/addok` embarque addok 1.0.3, figé depuis 2022. addok-rs est comparé à la pile Python à jour : addok 1.3.2, addok-fr, addok-france et addok-csv.
+- **Une seule combinaison, écrite dans le code.** addok assemble son traitement à partir de plugins ; addok-rs écrit en dur la seule combinaison que la BAN utilise. C'est ce qui permet de vérifier chaque réponse face à addok, au prix de ne servir que les adresses françaises de la BAN.
+- **Un seul index national, construit en une passe depuis l'export Addok.** Le classement d'addok dépend de statistiques nationales (un mot devient « courant » au-delà de 10 000 documents) : des index par département ne répondraient pas pareil. L'outre-mer est gardé pour la même raison.
+- **Un fichier projeté en mémoire, en lecture seule, à la place de Redis et SQLite.** Le démarrage est instantané, tous les threads lisent le même index sans verrou, et une nouvelle édition de la BAN est un nouveau fichier qui remplace l'ancien d'un coup.
+- **Des ex æquo départagés par une règle fixe** : le score, puis l'importance, puis l'identifiant BAN. addok s'en remet au hasard ; addok-rs donne toujours la même réponse à la même requête.
+- **Les défauts d'addok-csv sont corrigés, pas reproduits :** un séparateur mal deviné, un fichier refusé pour une seule ligne trop longue, `result_street` toujours vide.
+- **Du CSV de la BAN, seule l'ancienne commune de chaque numéro est prise ; le code postal reste celui de la voie.** L'export Addok donne à tous les numéros d'une voie l'ancienne commune et le code postal de la voie. Les deux exports de la BAN ont été comparés sur 26 millions de numéros :
+  - **pour l'ancienne commune, le CSV a raison :** les contours officiels des communes déléguées lui donnent raison 94 fois sur 100, contre 4 pour l'export Addok. `--numbers` la prend ;
+  - **pour le code postal, aucun des deux n'est meilleur :** confronté aux codes postaux que déclarent les entreprises aux mêmes adresses (SIRENE), celui du CSV n'est juste qu'une fois sur deux là où les exports divergent. Sa source n'est plus mise à jour depuis 2023, et le géocodeur de l'État répond lui aussi celui de la voie. addok-rs garde celui de la voie, jusqu'à ce que la BAN publie un code postal par adresse tiré de sa nouvelle source.
 
 ---
 
@@ -138,12 +235,13 @@ La montée est presque linéaire sur les 6 cœurs performance du M1 Pro ; les 2 
 
 ### Mieux qu'addok, à la demande
 
-Chaque amélioration est désactivée par défaut, afin qu'addok-rs réponde comme addok tant qu'on ne demande rien d'autre. Chacune a été mesurée sur des adresses réelles.
+Chaque amélioration est désactivée par défaut, afin qu'addok-rs réponde comme addok tant qu'on ne demande rien d'autre : les quatre premières se demandent par requête, la dernière à la construction de l'index. Chacune a été mesurée sur des adresses réelles.
 
 - **Le repli sur la commune quand le code postal est faux,** avec `postcode_fallback=1`. `4 RUE CLEMENT MAROT, PERPIGNAN, 66100` rend le 4 rue Clément Marot à Perpignan (66000), là où addok répond une autre rue sous le seuil. Sur 648 328 adresses réelles, il fait trouver plus de 2 000 adresses justes de plus, pour la même part de réponses justes.
 - **Le numéro sans complément quand la BAN ne l'a pas,** avec `plain_number=1`. `12 BIS RUE DE LA PAIX, PARIS` rend le 12 rue de la Paix quand la BAN n'a pas le 12 bis, là où addok ne rend que la voie. Le numéro simple est à une vingtaine de mètres du numéro saisi, le point de la voie à 90 m. Sur 7,68 millions d'adresses réelles, 40 000 réponses gagnent ainsi leur numéro, sans qu'aucun score change.
 - **L'adresse la plus proche en géocodage inverse,** avec `nearest=1` : là où addok ne regarde qu'aux alentours immédiats (une centaine de mètres), elle cherche dans un rayon de 5 km. À 1 km d'une adresse, addok ne répond rien une fois sur cinq ; `nearest` répond toujours, et rend la même réponse qu'addok partout où la sienne est la plus proche.
 - **Le numéro découpé,** avec `result_columns` : `result_num` (`12`), `result_num_complement` tel que la BAN l'écrit (`bis`), et sa forme courte (`b`) pour rapprocher d'autres données.
+- **L'ancienne commune propre à chaque numéro,** avec `--numbers` à la construction de l'index. Dans une commune nouvelle, addok donne à tous les numéros d'une voie l'ancienne commune de sa première adresse ; addok-rs donne à chacun la sienne, lue dans l'export CSV de la BAN. Sur la BAN du 24 novembre 2026, 19 178 numéros changent d'ancienne commune, et les contours officiels donnent raison au nouveau résultat 94 fois sur 100. Rien d'autre ne change, ni le score ni le code postal.
 
 ---
 
@@ -169,41 +267,6 @@ Tout le reste est un **écart**, et chaque écart doit être expliqué. Deux ord
 - **Le JSON** de `/search` a été comparé à celui d'addok sur 90 128 requêtes : les mêmes adresses, autocomplétion active et non, en cours de saisie, autour d'un point proche ou lointain et sans point, sous les limites 1, 5, 10, 50 et 100 et sous plusieurs filtres, plus les cas limites des paramètres. Les 629 984 résultats que les deux donnent au même rang sont identiques, propriété par propriété, distance comprise. Sur 2 131 requêtes, la recherche diverge à un rang ou un autre : chaque écart est expliqué par les ordres qu'addok laisse au hasard.
 - **Le géocodage inverse** a été comparé à celui d'addok sur 43 094 requêtes : des positions tirées de la BAN, sur une adresse, à 30 m, 300 m et 2 km, et au hasard, sous plusieurs limites et filtres, plus les cas limites des paramètres ; et sur 20 fichiers de 1 000 lignes pour `/reverse/csv` : chaque réponse est identique, à l'ordre près des adresses à égale distance.
 - **addok n'est pas toujours d'accord avec lui-même.** D'une graine de hachage ou d'une construction de l'index à l'autre, il change son meilleur résultat sur 80 de ces requêtes, et son deuxième sur 210 : aucune réimplémentation ne peut faire mieux que ce seuil.
-
----
-
-## Démarrage rapide
-
-### Avec Docker
-
-```sh
-# 1. Télécharger l'export Addok de la BAN (1,3 Go, republié chaque nuit)
-mkdir -p index && cd index
-curl -LO https://adresse.data.gouv.fr/data/ban/adresses/latest/addok/adresses-addok-france.ndjson.gz
-
-# 2. Construire l'index (environ 1 min 30)
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/data" --entrypoint addok-cli \
-  ghcr.io/wildbenji/addok-rs build /data/adresses-addok-france.ndjson.gz /data/ban.addok
-
-# 3. Servir l'index
-docker run -d --name addok-rs -p 7878:7878 -v "$PWD:/data:ro" ghcr.io/wildbenji/addok-rs
-curl http://localhost:7878/health
-```
-
-### Depuis les sources
-
-```sh
-cargo build --release
-target/release/addok-cli build adresses-addok-france.ndjson.gz ban.addok
-
-# Géocoder un fichier, sans serveur
-target/release/addok-cli batch ban.addok adresses.parquet geocodees.parquet --columns adresse,ville,code_postal
-
-# Ou servir l'index en HTTP
-target/release/addok-cli serve ban.addok --host 0.0.0.0
-```
-
-Tout le reste est dans le **[guide d'utilisation](HOW-TO-USE.md)** : paramètres, exemples de clients, colonnes de résultat, mise à jour de la BAN, mise en production et dépannage.
 
 ---
 

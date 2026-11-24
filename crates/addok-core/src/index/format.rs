@@ -22,7 +22,9 @@ compile_error!("the index file is little-endian, and read in place");
 
 const MAGIC: &[u8; 8] = b"addok-rs";
 /// Bumped when a reader of the previous version would misread the file.
-const VERSION: u32 = 1;
+/// 2: house numbers' own former communes, which a reader of 1 would skip
+/// and answer their street's.
+const VERSION: u32 = 2;
 const TRAILER: usize = 32;
 const ENTRY: usize = 24;
 const ALIGNMENT: usize = 8;
@@ -99,6 +101,7 @@ kinds! {
     GeohashCells = 42: u64,
     GeohashOffsets = 43: u32,
     Geohashes = 44: u32,
+    HnOwnFields = 45: [u32; 3],
 }
 
 /// Writes sections, then their table and the trailer.
@@ -485,6 +488,11 @@ mod tests {
         assert_eq!(
             Sections::read(bytes.as_ref()).err(),
             Some(OpenError::Version(9))
+        );
+        patch(&mut bytes, TRAILER - 8, 1);
+        assert_eq!(
+            Sections::read(bytes.as_ref()).err(),
+            Some(OpenError::Version(1))
         );
         let missing = file(Some(Kind::Pairs), false);
         let error = Some(OpenError::MissingSection("Pairs"));
