@@ -5,6 +5,7 @@
 //! addok-cli serve ban.addok --host 0.0.0.0 --port 7878
 //! addok-cli batch ban.addok addresses.parquet geocoded.parquet --columns ad3,city,zip_code
 //! addok-cli reverse ban.addok positions.parquet addresses.parquet --nearest on
+//! addok-cli export ban.addok housenumbers.parquet
 //! addok-cli --version
 //! ```
 
@@ -60,7 +61,10 @@ usage:
     --radius M                the nearest's radius in metres, up to 10000 (default: 5000)
     --filters, --input-format, --output-format, --input-delimiter, --output-delimiter,
     --cores N                 as for batch
-  addok-cli --version                      print addok-cli's version, as /health gives it
+  addok-cli export <index> <output.parquet>
+                                           every house number of the index, one row each, with
+                                           the result columns batch answers it with, and its banId
+  addok-cli --version                     print addok-cli's version, as /health gives it
 
   --cores N: how many cores to use, from 1 to the machine's (default: all of them)";
 
@@ -72,6 +76,7 @@ fn main() -> ExitCode {
         ["serve", index, ref options @ ..] => serve(index, options),
         ["batch", index, input, output, ref options @ ..] => batch_file(index, input, output, options),
         ["reverse", index, input, output, ref options @ ..] => reverse_file(index, input, output, options),
+        ["export", index, output] => export(index, output),
         ["--version"] => {
             println!("addok-cli {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -283,6 +288,20 @@ fn reverse_file(index: &str, input: &str, output: &str, options: &[&str]) -> Res
         table.num_rows(),
         table.num_rows() as f64 / elapsed
     );
+    Ok(())
+}
+
+/// Every house number of the index, as batch answers it, into a Parquet
+/// file.
+fn export(index: &str, output: &str) -> Result<(), String> {
+    if Format::of_file(output, batch::DELIMITER) != Some(Format::Parquet) {
+        return Err(format!("{output}: export writes Parquet, name it .parquet"));
+    }
+    let index = open(index)?;
+    let start = Instant::now();
+    let out = File::create(output).map_err(|e| format!("{output}: {e}"))?;
+    let rows = addok_cli::export::export(&index, BufWriter::new(out)).map_err(|e| format!("{output}: {e}"))?;
+    println!("{output}: {rows} house numbers in {:.1} s", start.elapsed().as_secs_f64());
     Ok(())
 }
 

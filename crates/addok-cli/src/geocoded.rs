@@ -1,7 +1,7 @@
 //! A row's best result as addok-csv keeps it, typed: what `/search/csv`
 //! writes as text, and batch writes as columns.
 
-use addok_core::document::{Document, Number, Text};
+use addok_core::document::{Document, HouseNumber, Number, Text};
 use addok_core::index::Index;
 use addok_core::search::{Center, Filters, Found, Options, search, search_with};
 use addok_core::text::{QUERY_MAX_LENGTH, QueryTooLong, fold, is_street_type, short_ordinal};
@@ -451,8 +451,19 @@ fn words(text: &str) -> Vec<String> {
 }
 
 fn geocoded(best: &Found, next: Option<&Found>) -> Geocoded {
-    let document = &best.document;
-    let (lat, lon) = match &best.housenumber {
+    Geocoded {
+        label: best.label().to_owned(),
+        score: round(best.score),
+        score_next: next.map(|next| round(next.score)),
+        ..answered(&best.document, best.housenumber.as_ref())
+    }
+}
+
+/// What a result writes of the document it answers with and of the house
+/// number it is, if any: everything but what the query decides, its label
+/// and scores, left empty and 0.
+pub fn answered(document: &Document, housenumber: Option<&HouseNumber>) -> Geocoded {
+    let (lat, lon) = match housenumber {
         Some(housenumber) => (Some(housenumber.lat), Some(housenumber.lon)),
         None => (document.lat, document.lon),
     };
@@ -460,12 +471,12 @@ fn geocoded(best: &Found, next: Option<&Found>) -> Geocoded {
     Geocoded {
         lat,
         lon,
-        label: best.label().to_owned(),
-        score: round(best.score),
-        score_next: next.map(|next| round(next.score)),
-        kind: best.kind().to_owned(),
-        id: best.id().to_owned(),
-        housenumber: best.housenumber.as_ref().map(|housenumber| housenumber.number.clone()),
+        label: String::new(),
+        score: 0.0,
+        score_next: None,
+        kind: housenumber.map_or(&document.kind[..], |_| "housenumber").to_owned(),
+        id: housenumber.map_or(&document.id, |housenumber| &housenumber.id).clone(),
+        housenumber: housenumber.map(|housenumber| housenumber.number.clone()),
         name: text(&document.name),
         postcode: text(&document.postcode),
         city: text(&document.city),

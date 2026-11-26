@@ -129,7 +129,7 @@ fn error(error: impl std::fmt::Display) -> Error {
 }
 
 /// The result columns, in order.
-const RESULTS: [(&str, DataType); 16] = [
+pub(crate) const RESULTS: [(&str, DataType); 16] = [
     ("latitude", DataType::Float64),
     ("longitude", DataType::Float64),
     ("result_label", DataType::Utf8),
@@ -247,17 +247,21 @@ pub fn geocode_table<B: AsRef<[u8]> + Sync>(
 
     let mut results: Vec<(&str, DataType, ArrayRef)> =
         RESULTS.iter().zip(result_columns(&rows)).map(|((name, kind), array)| (*name, kind.clone(), array)).collect();
+    for (name, column) in SPLIT_COLUMNS.into_iter().zip(split_columns(&rows)) {
+        if options.result_columns.iter().any(|named| named == name) {
+            results.push((name, DataType::Utf8, column));
+        }
+    }
+    Ok((with_results(table, results)?, warnings))
+}
+
+/// The house number split of these rows, in `SPLIT_COLUMNS`' order.
+pub(crate) fn split_columns(rows: &[Option<Geocoded>]) -> [ArrayRef; 3] {
     let parts: Vec<[Option<String>; 3]> = rows
         .iter()
         .map(|row| row.as_ref().and_then(|row| row.housenumber.as_deref()).map(split_housenumber).unwrap_or_default())
         .collect();
-    for (i, name) in SPLIT_COLUMNS.into_iter().enumerate() {
-        if options.result_columns.iter().any(|named| named == name) {
-            let column: StringArray = parts.iter().map(|part| part[i].as_deref()).collect();
-            results.push((name, DataType::Utf8, Arc::new(column)));
-        }
-    }
-    Ok((with_results(table, results)?, warnings))
+    std::array::from_fn(|i| Arc::new(parts.iter().map(|part| part[i].as_deref()).collect::<StringArray>()) as ArrayRef)
 }
 
 /// The reverse result columns, in order, as `/reverse/csv` writes them,
@@ -420,7 +424,7 @@ fn with_results(table: &RecordBatch, results: Vec<(&str, DataType, ArrayRef)>) -
 }
 
 /// The result columns of these rows, in `RESULTS`'s order.
-fn result_columns(rows: &[Option<Geocoded>]) -> Vec<ArrayRef> {
+pub(crate) fn result_columns(rows: &[Option<Geocoded>]) -> Vec<ArrayRef> {
     let float = |value: fn(&Geocoded) -> Option<f64>| -> ArrayRef {
         let mut column = Float64Builder::with_capacity(rows.len());
         for row in rows {
@@ -459,11 +463,8 @@ fn result_columns(rows: &[Option<Geocoded>]) -> Vec<ArrayRef> {
 pub fn write(table: &RecordBatch, format: Format) -> Result<Vec<u8>, Error> {
     match format {
         Format::Parquet => {
-            let properties = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                .build();
             let mut writer =
-                ArrowWriter::try_new(Vec::new(), table.schema(), Some(properties)).map_err(error)?;
+                ArrowWriter::try_new(Vec::new(), table.schema(), Some(parquet_properties())).map_err(error)?;
             writer.write(table).map_err(error)?;
             writer.into_inner().map_err(error)
         }
@@ -490,6 +491,13 @@ pub fn write(table: &RecordBatch, format: Format) -> Result<Vec<u8>, Error> {
             Ok(out.into_bytes())
         }
     }
+}
+
+/// How a Parquet file is written: compressed with zstd.
+pub(crate) fn parquet_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+        .build()
 }
 
 fn dialect(delimiter: char) -> Dialect {

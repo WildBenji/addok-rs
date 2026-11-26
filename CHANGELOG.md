@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.17.0 — 2026-11-26
+
+Every house number of an index, exported as batch answers it. No change in answers, and the index format is v0.16.0's.
+
+### Added
+
+- **`addok-cli export <index> <output.parquet>`** writes one row per house number of the index, sorted by `result_id`. Each row carries the result columns `addok-cli batch` writes for that number, under the same names and types, with the same values, case included: `result_id`, `result_housenumber`, `result_num`, `result_num_complement`, `result_num_complement_short`, `result_name`, `result_postcode`, `result_citycode`, `result_city`, `result_oldcitycode`, `result_oldcity`, `result_context`, `result_district`, `latitude` and `longitude`. One more column, `result_ban_id`, holds the number's `banId`, which batch does not write.
+  - **Why:** for addresses that need no geocoding, but must read exactly as a geocoded address would.
+  - **Exact by construction:** the export builds each row with the code batch builds its answers with, from the document search and reverse answer with. A test checks every row against batch's answer to its address, column by column. On the national index, a sample of 200,000 rows geocoded by `batch` gave the same values on every column for every row that came back as the same number (199,676).
+  - **The numbers are those the index keeps,** every one search or reverse can answer: of two numbers of a street written alike (`2B`, `2bis`), the one search answers.
+  - **On the BAN of 2026-11-24:** 26,079,295 rows, each id once, in 62 s on one core of an M1 Pro, a 952 MB file.
+
 ## v0.16.1 — 2026-11-24
 
 A dependency past its advisory. No change in answers, and the index format is v0.16.0's.

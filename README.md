@@ -93,6 +93,7 @@ Une première compilation prend quelques minutes. Pour une nouvelle édition de 
 | Échanger des fichiers typés avec un autre programme | `POST /batch`, en Parquet ou en CSV, à l'aller comme au retour |
 | Chercher une adresse à la fois, avec ou sans autocomplétion | `GET /search`, le GeoJSON d'addok |
 | Trouver l'adresse d'une position | `GET /reverse`, `POST /reverse/csv`, `POST /reverse/batch`, `addok-cli reverse` |
+| Avoir tous les numéros de l'index, tels qu'un géocodage les rendrait | `addok-cli export`, en Parquet |
 | Savoir si le serveur est prêt, et sur quel index | `GET /health` |
 
 - **Le résultat** de chaque adresse vient dans les colonnes d'addok-csv (`result_label`, `result_score`, `result_type`, `result_id`, `result_housenumber`, `result_postcode`, `result_citycode`, …). Le score va de 0 à 1 : `addok-cli batch` laisse sans résultat ce qui ne dépasse pas 0,5, réglable avec `--min-score`.

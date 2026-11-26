@@ -22,7 +22,7 @@ addok-rs géocode des adresses françaises, par fichiers entiers ou une à une, 
 
 ## 1. Choisir son mode d'utilisation
 
-addok-rs est un seul programme, `addok-cli`, avec quatre commandes :
+addok-rs est un seul programme, `addok-cli`, avec cinq commandes :
 
 | Commande | Rôle |
 |---|---|
@@ -30,6 +30,7 @@ addok-rs est un seul programme, `addok-cli`, avec quatre commandes :
 | `addok-cli batch` | Géocode un fichier entier, Parquet ou CSV, sur tous les cœurs, sans serveur. |
 | `addok-cli reverse` | Trouve l'adresse de chaque position d'un fichier, Parquet ou CSV, sans serveur. |
 | `addok-cli serve` | Sert l'index en HTTP, sur le port 7878 comme addok. |
+| `addok-cli export` | Écrit tous les numéros de l'index en Parquet, avec les valeurs que rend `batch`. |
 
 Quel que soit le mode, il faut d'abord [construire l'index](#3-construire-lindex). Ensuite :
 
@@ -252,6 +253,21 @@ addok-cli reverse ban.addok positions.csv adresses.csv --lat y --lon x --nearest
 - **Les colonnes de résultat** sont celles de `/reverse/csv` : `result_latitude`, `result_longitude`, `result_label`, `result_distance` (en mètres entiers), `result_type`, `result_id`, `result_housenumber`, puis les champs de l'adresse. En Parquet, coordonnées et distance sont des nombres, et une ligne sans résultat a des cellules nulles.
 - **`--nearest on`** cherche l'[adresse la plus proche](#ladresse-la-plus-proche--nearest), où qu'elle soit dans le rayon `--radius` (en mètres, 5 000 par défaut, 10 000 au plus), là où addok ne cherche qu'aux alentours immédiats.
 - **`--filters`**, les formats, les séparateurs et `--cores` s'emploient comme pour `addok-cli batch`.
+
+### Exporter tous les numéros : `addok-cli export`
+
+`addok-cli export` écrit une ligne par numéro de l'index, avec les valeurs exactes que `addok-cli batch` rend quand il trouve ce numéro. C'est utile pour des adresses qu'on n'a pas besoin de géocoder, mais qui doivent se lire comme une adresse géocodée :
+
+```sh
+addok-cli export ban.addok numeros.parquet
+```
+
+- **Les colonnes** portent les noms et les types de `batch` : `result_id`, `result_housenumber`, `result_num`, `result_num_complement`, `result_num_complement_short`, `result_name` (la voie), `result_postcode`, `result_citycode`, `result_city`, `result_oldcitycode`, `result_oldcity`, `result_context`, `result_district`, `latitude` et `longitude` (des nombres), plus `result_ban_id`, l'identifiant `banId` du numéro, que `batch` ne donne pas. Les valeurs sont celles de `batch`, casse comprise, et vides là où `batch` les laisse vides.
+- **Les numéros** sont ceux que l'index garde : tous ceux qu'une recherche ou un géocodage inverse peut rendre. Quand deux numéros d'une voie s'écrivent de façon équivalente (`2B` et `2bis`), seul celui que rend la recherche est écrit.
+- **Les lignes** sont triées par `result_id`. Sur l'index national, chaque identifiant n'y figure qu'une fois.
+- **Avec `--numbers`** à la construction, chaque numéro porte son ancienne commune propre, comme dans les réponses de `batch`.
+- **Le format** est Parquet, compressé en zstd. Sur l'index national, 26,1 millions de lignes s'écrivent en une minute environ, sur un cœur, pour un fichier d'un peu moins de 1 Go.
+- **L'export vaut pour l'index** sur lequel il est fait : après une reconstruction, on le refait.
 
 ---
 
@@ -500,7 +516,7 @@ curl http://localhost:7878/health
 ```
 
 ```json
-{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.16.1"}
+{"cores":8,"documents":2464369,"status":"HEALTHY","version":"0.17.0"}
 ```
 
 - **La réponse est immédiate :** pas de géocodage, et pas d'attente derrière les requêtes en cours, même quand tous les cœurs sont occupés. C'est le point à interroger au démarrage, jusqu'à ce qu'il réponde, puis pour la supervision.
